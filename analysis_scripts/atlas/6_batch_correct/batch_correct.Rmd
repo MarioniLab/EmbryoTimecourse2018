@@ -1,0 +1,275 @@
+---
+title: "Batch correction"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+
+```{r setup, message=FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+#set it up for scran to be properly parallelised
+library(BiocParallel)
+ncores = 16
+mcparam = SnowParam(workers = ncores)
+register(mcparam)
+library(irlba)
+library(cowplot)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE)
+
+nPC = 50
+
+# #subset for testing
+# sce = normalize(sce[,meta$stage %in% c("E7.25", "E7.5")])
+# meta = meta[meta$stage %in% c("E7.25", "E7.5"),]
+
+```
+
+In this script, we perform batch correction on our data.
+
+
+#Batch correction
+
+For batch correction, we employ the scran function `fastMNN`, which performs batch correction in the manner of `mnnCorrect`, but in the PC-space, and much faster. Specifically, we will perform 3 types of correction:
+
+1. Correction of entire dataset, using PCs calculated over all cells using HVGs from all cells
+
+2. Correction per timepoint, using PCs calculated for cells of each timepoint, using HVGs calculated at each timepoint
+
+3. Correction per Theiler stage, using PCs calculated for cells of each Theiler stage, using HVGs calculated at each Theiler stage
+
+Three types of correction are important: considering each timepoint/Theiler stage separately will provide a greater resolution of the structure of the data rather than subsetting coordinates from a single large PCA.
+
+##Total correction
+
+```{r mnncorrect-all}
+
+hvgs = getHVGs(sce)
+
+#get order: oldest to youngest; most cells to least cells
+order_df = meta[!duplicated(meta$sample), c("stage", "sample")]
+order_df$ncells = sapply(order_df$sample, function(x) sum(meta$sample == x))
+order_df$stage = factor(order_df$stage, 
+                        levels = rev(c("E8.5", 
+                                   "E8.25", 
+                                   "E8.0", 
+                                   "E7.75", 
+                                   "E7.5", 
+                                   "E7.25", 
+                                   "mixed_gastrulation", 
+                                   "E7.0", 
+                                   "E6.75", 
+                                   "E6.5")))
+order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+order_df$stage = as.character(order_df$stage)
+
+all_correct = doBatchCorrect(counts = logcounts(sce)[rownames(sce) %in% hvgs,], 
+                             timepoints = meta$stage, 
+                             samples = meta$sample, 
+                             timepoint_order = order_df$stage, 
+                             sample_order = order_df$sample, 
+                             npc = 50,
+                             BPPARAM = mcparam)
+
+
+save(all_correct, file = "/nfs/research1/marioni/jonny/embryos/scripts/batch_correct/all_correction.RData")
+
+```
+
+A t-SNE visualisation of all cells, pre- and post-correction, is shown in Figure \@ref(fig:compare-all).
+
+```{r compare-all, fig.height = 14, fig.wide = TRUE, fig.cap = "Correction over all data."}
+
+base_pca = prcomp_irlba(t(logcounts(sce)[rownames(sce) %in% hvgs,]), n = nPC)$x
+base_tsne = Rtsne(base_pca, pca = FALSE)$Y
+corrected_tsne = Rtsne(all_correct, pca = FALSE)$Y
+
+base_tsne = as.data.frame(base_tsne)
+base_tsne$sample = meta$sample
+base_tsne$state = "Uncorrected"
+
+corrected_tsne = as.data.frame(corrected_tsne)
+corrected_tsne$sample = meta$sample
+corrected_tsne$state = "Corrected"
+
+bc_tsne = rbind(base_tsne, corrected_tsne)
+
+reorder = sample(nrow(bc_tsne), nrow(bc_tsne))
+
+ggplot(bc_tsne[reorder,], aes(x = V1, y = V2, col = factor(sample))) +
+  geom_point(size = 0.4) +
+  scale_colour_Publication() +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  facet_wrap(~state, nrow = 2)
+
+```
+
+##Timepoint correction
+
+
+```{r mnncorrect-timepoint}
+
+stage_corrections = lapply(unique(meta$stage), function(x){
+  sub_sce = normalize(sce[,meta$stage == x])
+  sub_meta = meta[meta$stage == x,]
+  hvgs = getHVGs(sub_sce)
+  
+  correct = doBatchCorrect(counts = logcounts(sub_sce)[rownames(sub_sce) %in% hvgs,], 
+                           timepoints = sub_meta$stage, 
+                           samples = sub_meta$sample, 
+                           timepoint_order = order_df$stage, 
+                           sample_order = order_df$sample, 
+                           npc = 50,
+                           BPPARAM = mcparam)
+  return(correct)
+  
+})
+names(stage_corrections) = unique(meta$stage)
+
+```
+
+
+t-SNE visualisations of cells at each timepoint, pre- and post-correction, are shown in Figure \@ref(fig:compare-stage). Corrections were computed in the scope of each timepoint exclusively (i.e. for calculation of HVGs, PCA).
+
+```{r compare-stage, fig.height = 20, fig.wide = FALSE, fig.cap = "Correction computed for each timepoint separately."}
+
+tsnes = lapply(stage_corrections, Rtsne, pca = FALSE)
+tsnes = lapply(tsnes, function(x) as.data.frame(x$Y))
+for(i in 1:length(tsnes)){
+  tsnes[[i]]$stage = unique(meta$stage)[i]
+  tsnes[[i]]$sample = meta$sample[meta$stage == unique(meta$stage)[i]]
+  tsnes[[i]]$state = "Corrected"
+}
+
+base_pcas = lapply(unique(meta$stage), function(x){
+  sub_sce = normalize(sce[,meta$stage == x])
+  sub_meta = meta[meta$stage == x,]
+  hvgs = getHVGs(sub_sce)
+  
+  pca = prcomp_irlba(t(logcounts(sub_sce)[rownames(sub_sce) %in% hvgs,]), n = nPC)
+  return(pca$x)
+})
+base_tsnes = lapply(base_pcas, Rtsne, pca = FALSE)
+base_tsnes = lapply(base_tsnes, function(x) as.data.frame(x$Y))
+for(i in 1:length(base_tsnes)){
+  base_tsnes[[i]]$stage = unique(meta$stage)[i]
+  base_tsnes[[i]]$sample = meta$sample[meta$stage == unique(meta$stage)[i]]
+  base_tsnes[[i]]$state = "Uncorrected"
+}
+
+big_df = rbind(
+  do.call(rbind, base_tsnes),
+  do.call(rbind, tsnes)
+)
+
+reorder = sample(nrow(big_df), nrow(big_df))
+
+ggplot(big_df[reorder,], aes(x = V1, y = V2, col = factor(sample))) +
+  geom_point(size = 0.4) +
+  scale_colour_Publication() +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  facet_grid(stage~state)
+
+
+```
+
+##Theiler stage correction
+
+```{r mnncorrect-theiler}
+
+theiler_corrections = lapply(unique(meta$theiler), function(x){
+  sub_sce = normalize(sce[,meta$theiler == x])
+  sub_meta = meta[meta$theiler == x,]
+  hvgs = getHVGs(sub_sce)
+  
+  correct = doBatchCorrect(counts = logcounts(sub_sce)[rownames(sub_sce) %in% hvgs,], 
+                           timepoints = sub_meta$stage, 
+                           samples = sub_meta$sample, 
+                           timepoint_order = order_df$stage, 
+                           sample_order = order_df$sample, 
+                           npc = 50,
+                           BPPARAM = mcparam)
+  return(correct)
+  
+})
+
+names(theiler_corrections) = unique(meta$theiler)
+
+
+```
+
+t-SNE visualisations of cells at each Theiler stage, pre- and post-correction, are shown in Figure \@ref(fig:compare-theiler). Corrections were computed in the scope of each Theiler stage exclusively (i.e. for calculation of HVGs, PCA).
+
+```{r compare-theiler, fig.height = 20, fig.cap = "Correction computed for each Theiler stage."}
+
+tsnes = lapply(theiler_corrections, Rtsne, pca = FALSE)
+tsnes = lapply(tsnes, function(x) as.data.frame(x$Y))
+for(i in 1:length(tsnes)){
+  tsnes[[i]]$theiler = unique(meta$theiler)[i]
+  tsnes[[i]]$sample = meta$sample[meta$theiler == unique(meta$theiler)[i]]
+  tsnes[[i]]$state = "Corrected"
+}
+
+base_pcas = lapply(unique(meta$theiler), function(x){
+  sub_sce = normalize(sce[,meta$theiler == x])
+  sub_meta = meta[meta$theiler == x,]
+  hvgs = getHVGs(sub_sce)
+  
+  pca = prcomp_irlba(t(logcounts(sub_sce)[rownames(sub_sce) %in% hvgs,]), n = nPC)
+  return(pca$x)
+})
+base_tsnes = lapply(base_pcas, Rtsne, pca = FALSE)
+base_tsnes = lapply(base_tsnes, function(x) as.data.frame(x$Y))
+
+for(i in 1:length(base_tsnes)){
+  base_tsnes[[i]]$theiler = unique(meta$theiler)[i]
+  base_tsnes[[i]]$sample = meta$sample[meta$theiler == unique(meta$theiler)[i]]
+  base_tsnes[[i]]$state = "Uncorrected"
+}
+
+big_df = rbind(
+  do.call(rbind, base_tsnes),
+  do.call(rbind, tsnes)
+)
+
+reorder = sample(nrow(big_df), nrow(big_df))
+
+ggplot(big_df[reorder,], aes(x = V1, y = V2, col = factor(sample))) +
+  geom_point(size = 0.4) +
+  scale_colour_Publication() +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  facet_grid(theiler~state)
+
+
+```
+
+```{r save}
+
+corrections = list("all" = all_correct, "theiler" = theiler_corrections, "stage" = stage_corrections)
+saveRDS(corrections, file = "/nfs/research1/marioni/jonny/embryos/data/corrected_pcas.rds")
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

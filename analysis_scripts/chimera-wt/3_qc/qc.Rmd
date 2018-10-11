@@ -1,0 +1,298 @@
+---
+title: "WT chimera: Cell Quality Control"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+```{r load_data, message = FALSE}
+
+library(Matrix)
+library(biomaRt)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(viridis)
+library(cowplot)
+
+#core functions inc. colour palette
+source("/nfs/research1/marioni/jonny/chimera-wt/scripts/core_functions.R")
+
+
+counts = readMM("/nfs/research1/marioni/jonny/chimera-wt/data/raw_counts.mtx")
+genes = read.table("/nfs/research1/marioni/jonny/chimera-wt/data/genes.tsv", stringsAsFactors = F)
+barcodes = read.table("/nfs/research1/marioni/jonny/chimera-wt/data/barcodes.tsv", stringsAsFactors = F)[,1]
+exp_design = read.table("/nfs/research1/marioni/jonny/chimera-wt/raw/meta/exp_design.csv", sep = ",", header = TRUE)
+
+```
+
+#Comparing sequencing saturation
+
+The 10X system uses unique molecular identifiers (UMIs). By considering how frequently the same UMIs have been sequenced, the saturation of sequencing can be estaimted (i.e. what % of captured molecules have been sequenced). Sample-wise median UMI counts are plotted alongside the sequencing saturations estimated by CellRanger in Figure \@ref(fig:sat).
+
+
+```{r sat, fig.cap="Sequencing saturations for each sample."}
+
+lib.sizes = colSums(counts)
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+samples = sapply(split_bc, function(x) x[2])
+
+pdf = data.frame(sample = seq_along(unique(exp_design$sample)),
+                 med_lib = sapply(seq_along(unique(exp_design$sample)), function(x) median(lib.sizes[samples == x])),
+                 mean_lib = sapply(seq_along(unique(exp_design$sample)), function(x) mean(lib.sizes[samples == x])),
+                 stage = sapply(seq_along(unique(exp_design$sample)), function(x) exp_design$stage[match(x, exp_design$sample)]), 
+                 saturation = sapply(seq_along(unique(exp_design$sample)), function(x){
+                   tab = read.table(paste0("/nfs/research1/marioni/jonny/chimera-wt/cellranger_out/sample_",
+                                                                         x,
+                                                                         "/outs/metrics_summary.csv"),
+                                    header = TRUE, 
+                                    sep = ",")
+                   stat = tab[1, "Sequencing.Saturation"]
+                   return(as.numeric(substr(stat, 1, 4)))
+                 }))
+
+ggplot(pdf, aes(x = med_lib, y = saturation, label = seq_along(unique(exp_design$sample)), fill = stage)) +
+  geom_label(alpha = 0.8) +
+  labs(x = "Median library size", y = "Sequencing Saturation (%)") +
+  theme_bw()
+
+
+```
+
+
+```{r plot_change, fig.cap="Cells dropped according to UMI threshold"}
+
+plot_change = function(barcodes, logical_keep){
+  split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+  samples = sapply(split_bc, function(x) x[2])
+  
+  pdf = data.frame(Sample = unique(samples),
+                   Total = sapply(unique(samples), function(x) sum(samples == x)),
+                   Dropped = sapply(unique(samples), function(x) sum(!logical_keep[samples == x])),
+                   Retained = sapply(unique(samples), function(x) sum(logical_keep[samples == x])))
+  
+  p = ggplot(data = pdf) +
+          geom_bar(mapping = aes(y = Total, 
+                                 x = factor(Sample, levels = unique(samples))), 
+                   fill = "darkgrey",
+                   stat = "identity") +
+          geom_bar(mapping = aes(y = Retained, 
+                                 x = factor(Sample, levels = unique(samples))), 
+                   fill = "coral",
+                   stat = "identity") +
+          geom_segment(mapping = aes(y = Total, 
+                                     yend = Retained, 
+                                     x = factor(Sample, levels = unique(samples)),  
+                                     xend = factor(Sample, levels = unique(samples))),
+                       arrow = arrow(length = unit(0.1, "inches"))) +
+          theme_bw() +
+          labs(y = "Number of cells", x= "Sample")
+  
+  pdf = rbind(pdf, data.frame(Sample = "Total", 
+                              Total = length(barcodes), 
+                              Dropped = sum(!logical_keep), 
+                              Retained = sum(logical_keep)))
+    
+  return(list(plot = p, df = pdf))
+}
+
+
+```
+
+#Mitochondrial gene expression
+
+Another useful QC metric is mitochondrial gene fraction: high measurements of mitochrondrial gene expression may indicate stressed cells, or incomplete lysis.
+
+To identify a threshold for cell exclusion, we assume that the "standard" set of mitchondrial UMI fractions can be modelled by a normal distribution. We centre this distribution on the median value, with median absolute deviation estimated variance. We then consider cells outlying if their mitochondrial UMI fraction has a corresponding FDR-adjusted $p<0.05$, and exclude these. The cutoff is shown graphically in Figure \@ref(fig:mt-frac), with quantification of cell exclusion in Figure \@ref(fig:mt-rem-plot) and Table \@ref(tab:mt-rem-tab)
+
+```{r mt-frac, fig.cap = "Mitochondrial read fractions"}
+
+
+lib.sizes = colSums(counts)
+
+mouse_ensembl = useMart("ensembl")
+mouse_ensembl = useDataset("mmusculus_gene_ensembl", mart = mouse_ensembl)
+
+gene_map = getBM(attributes=c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = genes[,1], mart = mouse_ensembl)
+mt.counts = counts[which(genes[,1] %in% gene_map$ensembl_gene_id[gene_map$chromosome_name=="MT"]),]
+mt.fraction = colSums(mt.counts)/lib.sizes
+
+#fit median-centered, MAD-variance normal 
+#crass 5%+
+# mt.lim = qnorm(0.95, mean = median(mt.fraction), sd = mad(mt.fraction))
+#fdr-corrected outliers
+#technically this should be a pt, but the df. is astronomically high so this is essentially the same
+mt.p = pnorm(mt.fraction, mean = median(mt.fraction), sd = mad(mt.fraction), lower.tail = FALSE)
+mt.lim = min(mt.fraction[which(p.adjust(mt.p, method = "fdr") < 0.05)])
+
+qplot(lib.sizes, mt.fraction, col = ifelse(mt.fraction>mt.lim, "drop", "keep")) +
+  scale_x_log10() +
+  labs(x = "UMI count", y = "MT read fraction") +
+  scale_color_manual(values = c("drop" = "grey50", "keep" = "black"), name = "")
+
+```
+
+```{r mt-rem-plot, fig.cap = "Cells dropped according to mitochondrial fraction threshold"}
+mt_drop = plot_change(barcodes, logical_keep = mt.fraction<mt.lim )
+
+print(mt_drop$plot)
+
+```
+
+
+```{r mt-rem-tab}
+
+
+kable(mt_drop$df, caption = "Cells dropped according to mitochondrial fraction threshold", row.names = FALSE)
+
+
+counts = counts[, mt.fraction < mt.lim]
+barcodes = barcodes[mt.fraction < mt.lim]
+mt.fraction = mt.fraction[mt.fraction < mt.lim]
+
+
+```
+
+The cutoff was at `r format(mt.lim*100, digits=3, nsmall = 2)`%
+
+
+#Number of detected genes
+
+The relationship between the number of UMIs per cell and the number of detected genes per cell is shown in Figure \@ref(fig:patterns). Note that these are well behaved between samples.
+
+```{r patterns, fig.width = 10, fig.height = 8, fig.wide=TRUE, fig.cap="Sample-wise plots of retained libraries"}
+
+lib.sizes = colSums(counts)
+n.genes = colSums(counts>0)
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+bcs = sapply(split_bc, function(x) x[1])
+samples = sapply(split_bc, function(x) x[2])
+
+plot_df = data.frame(lib = lib.sizes, genes = n.genes, sample = samples)
+plot_df = plot_df[sample(nrow(plot_df), nrow(plot_df), replace = FALSE),]
+
+p = ggplot(plot_df, aes(x = lib, y = genes)) +
+  geom_point(alpha = 0.5) +
+  scale_colour_Publication() +
+  scale_y_log10() +
+  scale_x_log10() +
+  theme_bw() +
+  facet_wrap(~factor(sample, levels = unique(sample)[order(unique(sample))]), ncol = 2) +
+  labs(x = "Number of UMIs", y = "Number of detected genes")
+
+suppressWarnings(plot(p))
+
+```
+
+As with the atlas dataset, the outlying, low-complexity cells are likely to be blood cells.
+
+#Inter-sample comparisons
+
+The distributions of UMI counts (Figure \@ref(fig:sample-box)) and mitchondrial read fractions (Figure \@ref(fig:mt-box)) are shown between the samples, below.
+
+
+```{r sample-box, fig.cap = "Sample-wise UMI count distributions"}
+
+
+p = ggplot(data.frame(lib = lib.sizes, sample = samples), aes (x = factor(sample, levels = unique(sample)), 
+                                                           y = lib.sizes)) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_log10() +
+  labs(x = "Sample", y = "Number of UMIs")
+
+suppressWarnings(plot(p))
+ 
+```
+
+```{r mt-box, fig.cap = "Sample-wise mitochrondrial UMI distributions"}
+p = ggplot(data.frame(mt = mt.fraction, sample = samples), aes (x = factor(sample, levels = unique(sample)), 
+                                                           y = mt)) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_log10() +
+  labs(x = "Sample", y = "Mitochondrial gene fraction")
+
+suppressWarnings(plot(p))
+
+```
+
+#Make meta
+
+We now save the metadata, recording for each cell its barcode, sample, and developmental stage.
+
+```{r meta}
+
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+bcs = sapply(split_bc, function(x) x[1])
+samples = sapply(split_bc, function(x) x[2])
+
+
+
+meta = data.frame(cell = paste0("cell_", 1:ncol(counts)),
+                  barcode = bcs,
+                  sample = samples,
+                  stage = exp_design$stage[match(samples, exp_design$sample)],
+                  tomato = as.logical(as.numeric(samples)%%2))
+
+```
+
+
+Finally, we have `r ncol(counts)` cells, Distributed between samples and stages as shown in Table \@ref(tab:kab).
+
+```{r kab}
+tab = as.matrix(table(meta$sample, meta$stage))
+
+new_rownames = c("Total", rownames(tab))
+tab = rbind(sapply(colnames(tab), function(x) sum(meta$stage == x)),
+            tab)
+rownames(tab) = new_rownames
+
+pt = kable(tab, caption = "Number of cells retained for analysis")
+pt
+
+```
+
+#Expected vs. retained cells
+
+10X provides estimates of the number of cells to expect to capture, given an input number of cells. Our final number of cells and the expected number of recovered cells is shown in Figure \@ref(fig:exp-obs)
+
+```{r exp-obs, fig.cap = "Expected vs observed number of recovered cells. The black line has gradient 1, intercept 0."}
+
+exp = exp_design
+
+exp$obs = sapply(exp$sample, function(x) sum(meta$sample == x))
+exp$cells = exp_design$expected
+
+ggplot(exp, aes(x = cells, y = obs, col = factor(sample))) +
+  geom_point() +
+  scale_colour_Publication(name = "Sample") +
+  scale_x_log10(breaks = c(500, 1000, 5000)) +
+  scale_y_log10(breaks = c(500, 1000, 5000)) +
+  labs(x = "Predicted number of cells", y = "Observed number of cells") +
+  geom_abline(slope = 1, intercept = 0)
+
+```
+
+
+# Save data
+
+```{r save-data}
+
+holder = writeMM(counts, file = "/nfs/research1/marioni/jonny/chimera-wt/data/raw_counts.mtx")
+saveRDS(as(counts, "dgCMatrix"), file = "/nfs/research1/marioni/jonny/chimera-wt/data/raw_counts.rds")
+write.table(barcodes, file = "/nfs/research1/marioni/jonny/chimera-wt/data/barcodes.tsv", row.names = F, col.names = F, quote = F, sep = "\t")
+write.table(meta, file = "/nfs/research1/marioni/jonny/chimera-wt/data/meta.tab", row.names = F, col.names = T, quote = F, sep = "\t")
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

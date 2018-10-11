@@ -1,0 +1,102 @@
+---
+title: "Swapped molecule removal"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+
+In this script, we exclude molecules that are likely to have derived from barcode swapping. In short, we identify molecules that share UMI, cell barcode, and aligned gene between samples that were sequenced together. These molecules are extremely unlikely to have arisen due to chance, and are instead far more likely to derive from barcode swapping. For more information on this phenomenon, please read [our paper](https://www.biorxiv.org/content/early/2018/04/06/177048). Figure \@ref(fig:plot-ratios) shows the fraction of molecules that were excluded, on a sample-by-sample basis.
+
+```{r do-batch1, message = FALSE}
+
+library(DropletUtils)
+library(ggplot2)
+library(cowplot)
+library(Matrix)
+
+mol_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 1:11, "/outs/molecule_info.h5")
+out_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 1:11, "/outs/raw_gene_bc_matrices/mm10/matrix_unswapped.mtx")
+bc_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 1:11, "/outs/raw_gene_bc_matrices/mm10/barcodes_unswapped.tsv")
+gene_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 1:11, "/outs/raw_gene_bc_matrices/mm10/genes_unswapped.tsv")
+
+unswapped = swappedDrops(mol_loc, get.swapped = TRUE)
+
+ratios = sapply(1:length(unswapped$cleaned), function(i){
+  sum(unswapped$swapped[[i]])/(sum(unswapped$cleaned[[i]]) + sum(unswapped$swapped[[i]]))
+})
+
+for(i in 1:length(mol_loc)){
+  null_holder = writeMM(unswapped$cleaned[[i]], file = out_loc[i])
+  write.table(colnames(unswapped$cleaned[[i]]), file = bc_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+  write.table(rownames(unswapped$cleaned[[i]]), file = gene_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+}
+
+```
+
+```{r do-batch2}
+
+rm(unswapped)
+hold = gc()
+
+mol_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 12:28, "/outs/molecule_info.h5")
+out_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 12:28, "/outs/raw_gene_bc_matrices/mm10/matrix_unswapped.mtx")
+bc_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 12:28, "/outs/raw_gene_bc_matrices/mm10/barcodes_unswapped.tsv")
+gene_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 12:28, "/outs/raw_gene_bc_matrices/mm10/genes_unswapped.tsv")
+
+unswapped = swappedDrops(mol_loc, get.swapped = TRUE)
+
+ratios = c(ratios, 
+           sapply(1:length(unswapped$cleaned), function(i){
+             sum(unswapped$swapped[[i]])/(sum(unswapped$cleaned[[i]]) + sum(unswapped$swapped[[i]]))
+             })
+)
+
+names(ratios) = 1:28
+
+for(i in 1:length(mol_loc)){
+  null_holder = writeMM(unswapped$cleaned[[i]], file = out_loc[i])
+  write.table(colnames(unswapped$cleaned[[i]]), file = bc_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+  write.table(rownames(unswapped$cleaned[[i]]), file = gene_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+}
+
+```
+
+```{r do-batch3}
+
+rm(unswapped)
+hold = gc()
+
+mol_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 29:37, "/outs/molecule_info.h5")
+out_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 29:37, "/outs/raw_gene_bc_matrices/mm10/matrix_unswapped.mtx")
+bc_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 29:37, "/outs/raw_gene_bc_matrices/mm10/barcodes_unswapped.tsv")
+gene_loc = paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_", 29:37, "/outs/raw_gene_bc_matrices/mm10/genes_unswapped.tsv")
+
+unswapped = swappedDrops(mol_loc, get.swapped = TRUE)
+
+ratios = c(ratios, 
+           sapply(1:length(unswapped$cleaned), function(i){
+             sum(unswapped$swapped[[i]])/(sum(unswapped$cleaned[[i]]) + sum(unswapped$swapped[[i]]))
+             })
+)
+
+names(ratios) = 1:37
+
+for(i in 1:length(mol_loc)){
+  null_holder = writeMM(unswapped$cleaned[[i]], file = out_loc[i])
+  write.table(colnames(unswapped$cleaned[[i]]), file = bc_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+  write.table(rownames(unswapped$cleaned[[i]]), file = gene_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+}
+
+```
+
+```{r plot-ratios, fig.cap = "Fraction of molecules removed due to barcode-swapping correction."}
+
+ggplot(data.frame(ratios = ratios, sample = 1:37), aes(x = sample, y = ratios)) +
+  geom_bar(stat = "identity", fill = "grey20") +
+  labs(x = "Sample", y = "Fraction of molecules excluded")
+
+```

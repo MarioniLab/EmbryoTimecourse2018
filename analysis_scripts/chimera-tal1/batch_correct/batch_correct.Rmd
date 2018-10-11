@@ -1,0 +1,257 @@
+---
+title: "Tal1 Chimera: Batch correction"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+
+```{r setup, message=FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+library(irlba)
+library(cowplot)
+
+source("/nfs/research1/marioni/jonny/chimera-tal1/scripts/core_functions.R")
+load_data()
+
+nPC = 50
+
+
+```
+
+In this script, we perform batch correction on our data.
+
+
+#Batch correction
+
+For batch correction, we employ the scran function `fastMNN`, which performs batch correction in the manner of `mnnCorrect`, but in the PC-space, and much faster. Critically, this is a composition-aware batch-correction strategy that should not be affected by the lack of e.g. blood cells in the knockout samples. We correct within each timepoint only.
+
+##Total correction
+
+```{r mnncorrect, message = FALSE}
+
+hvgs = getHVGs(sce)
+
+correct = doBatchCorrect(counts = logcounts(sce[hvgs,]),
+                         timepoints = as.character(meta$tomato), #first correct genotypes separately
+                         samples = meta$sample,
+                         timepoint_order = c("FALSE", "TRUE"), #host cells first
+                         sample_order = 1:4 #doesn't matter as pairwise correction
+                         )
+
+
+corrected = list(all = correct[match(meta$cell, rownames(correct)),])
+base = prcomp_irlba(t(logcounts(scater::normalize(sce[hvgs, ]))), n = nPC)$x
+
+saveRDS(corrected, file = "/nfs/research1/marioni/jonny/chimera-tal1/data/corrected_pcas.rds")
+saveRDS(base, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/base_pca.rds")
+
+
+```
+
+A t-SNE visualisation of our cells, pre- and post-correction, is shown in Figure \@ref(fig:compare-all).
+
+```{r compare-all, fig.height = 10, fig.wide = TRUE, fig.cap = "t-SNE of cells before and after correction. Red and coral cells are Tomato+ (injected), black and grey cells are Tomato- (embryo). Coral and grey cells mark the thrid and fourth samples in the E7.5 timepoint."}
+
+tsne_pre = Rtsne(base, pca = FALSE)$Y
+tsne_post = Rtsne(corrected$all, pca = FALSE)$Y
+
+ro = sample(nrow(base), nrow(base))
+
+
+
+
+p1 = ggplot(as.data.frame(tsne_pre)[ro,], aes(x = V1, y = V2, col = factor(meta$sample)[ro])) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = c("3" = "black", "1" = "red", "2" = "coral", "4" = "darkgrey")) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  ggtitle("Pre-correction")
+
+p2 = ggplot(as.data.frame(tsne_post)[ro,], aes(x = V1, y = V2, col = factor(meta$sample)[ro])) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = c("3" = "black", "1" = "red", "2" = "coral", "4" = "darkgrey")) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  ggtitle("Post-correction")
+
+
+plot_grid(p1, p2, nrow = 2)
+
+```
+
+#Celltype plots
+
+Figure \@ref(fig:celltype) shows the same plots, but coloured by the mapped celltype (see the mapping script for details). Doublets and stripped nuclei are excluded.
+
+```{r celltype, fig.wide = TRUE, fig.height=12, fig.cap = "t-SNE, coloured by celltype.", warning = FALSE}
+
+corrected_final = corrected$all[!meta$celltype.mapped %in% c("Stripped", "Doublet"),]
+meta_final = meta[!meta$celltype.mapped %in% c("Stripped", "Doublet"),]
+
+tsne_final = Rtsne(corrected_final, pca = FALSE)$Y
+
+ro = sample(nrow(meta_final), nrow(meta_final))
+
+plegend = ggplot(as.data.frame(tsne_final)[ro,], aes(x = V1, y = V2, col = factor(meta_final$celltype.mapped[ro], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = celltype_colours, name = "") +
+  theme(axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank())  +
+  guides(col = guide_legend(override.aes = list(size = 5), ncol = 5))
+
+p1 = ggplot(as.data.frame(tsne_final)[ro,], aes(x = V1, y = V2, col = factor(meta_final$celltype.mapped[ro], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.4) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank())
+
+
+
+plot_grid(p1, get_legend(plegend), ncol = 1)
+
+
+```
+
+# UMAP
+
+Finally, we generate UMAP coordinates of the batch-corrected data. Doublets and stripped nuclei are excluded. The UMAP is shown in Figure \@ref(fig:plot-umap).
+
+```{r generate-umap}
+
+write.table(corrected_final, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/scanpy_input.tab", sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+system("python3 /nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap.py")
+
+umap = read.table("/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/scanpy_output.tab", sep = "\t", header = FALSE)
+
+```
+
+```{r plot-umap, fig.height = 8, warning = FALSE, fig.cap = "UMAP of chimera cells."}
+
+p1 = ggplot(as.data.frame(umap)[ro,], aes(x = V1, y = V2, col = factor(meta_final$celltype.mapped[ro], levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.2) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank())
+
+plot_grid(p1, get_legend(plegend), ncol = 1)
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap.pdf",
+       width = 5, height = 5)
+
+       
+
+```
+
+The same UMAP plotted for Tomato positive and negative cells is shown in Figure \@ref(fig:umap-tomato).
+
+```{r umap-tomato, warning = FALSE, fig.cap = "UMAP plotted separately for Tomato+ or Tomato- cells"}
+
+p1 = ggplot(as.data.frame(umap)[meta_final$tomato,][ro,], aes(x = V1, y = V2, 
+                                                              col = factor(meta_final$celltype.mapped[meta_final$tomato][ro],
+                                                                           levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.2) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  lims(x= c(min(umap$V1), max(umap$V1)),
+       y= c(min(umap$V2), max(umap$V2)))
+
+p2 = ggplot(as.data.frame(umap)[!meta_final$tomato,][ro,], aes(x = V1, y = V2, 
+                                                              col = factor(meta_final$celltype.mapped[!meta_final$tomato][ro],
+                                                                           levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.2) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  lims(x= c(min(umap$V1), max(umap$V1)),
+       y= c(min(umap$V2), max(umap$V2)))
+
+plot_grid(p1 + ggtitle("Tom+"), p2 + ggtitle("Tom-"), ncol = 2)
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap_tom+.pdf",
+       width = 5, height = 5)
+
+ggsave(p2, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap_tom-.pdf",
+       width = 5, height = 5)
+
+write.table(umap, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap.tab", sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+
+```
+
+```{r umap_manual_order}
+
+rownames(umap) = meta_final$cell
+
+top = which(!meta_final$celltype.mapped %in% c("Mixed mesoderm", "Notochord"))
+bottom = which(meta_final$celltype.mapped %in% c("Mixed mesoderm", "Notochord"))
+ro = c(top[sample(length(top), length(top))],
+       bottom)
+
+umap_manual = umap[ro,]
+meta_manual = meta_final[ro,]
+meta_manual$X = umap_manual[,1]
+meta_manual$Y = umap_manual[,2]
+ 
+
+p1 = ggplot(meta_manual[meta_manual$tomato,], aes(x = X, y = Y, col = factor(celltype.mapped, levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.2) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  lims(x= c(min(umap$V1), max(umap$V1)),
+       y= c(min(umap$V2), max(umap$V2)))
+
+p2 = ggplot(meta_manual[!meta_manual$tomato,], aes(x = X, y = Y, col = factor(celltype.mapped, levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.2) +
+  scale_colour_manual(values = celltype_colours) +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  lims(x= c(min(umap$V1), max(umap$V1)),
+       y= c(min(umap$V2), max(umap$V2)))
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap_tom+_reordered.pdf",
+       width = 5, height = 5)
+
+ggsave(p2, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/batch_correct/umap_tom-_reordered.pdf",
+       width = 5, height = 5)
+
+```
+
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

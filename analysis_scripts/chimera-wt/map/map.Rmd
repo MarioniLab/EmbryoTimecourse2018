@@ -1,0 +1,595 @@
+---
+title: "WT chimera: Mapping to the atlas"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: true
+    theme: united
+---
+#Introduction & method
+
+In this script we map cells from the wild-type chimera onto our atlas dataset.
+
+```{r load, message = FALSE}
+library(Matrix)
+library(scran)
+library(scater)
+library(knitr)
+library(pheatmap)
+library(reshape2)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data()
+
+atlas_sce = sce
+atlas_meta = meta
+atlas_meta$celltype[atlas_meta$doublet] = "Doublet"
+atlas_meta$celltype[atlas_meta$stripped] = "Stripped"
+
+
+#Downsample to 10k cells per sample (or maximum number of cells in sample)
+set.seed(42)
+keep = lapply(unique(atlas_meta$stage), function(x){
+  if(x == "mixed_gastrulation"){
+    return(c())
+  } else if(sum(atlas_meta$stage == x) < 10000) {
+    return(which(atlas_meta$stage == x))
+  } else {
+    hits = which(atlas_meta$stage == x)
+    return(sample(hits, 10000))
+  }
+})
+keep = do.call(c, keep)
+
+atlas_sce = scater::normalize(atlas_sce[,keep])
+atlas_meta = atlas_meta[keep,]
+
+source("/nfs/research1/marioni/jonny/chimera-wt/scripts/core_functions.R")
+load_data()
+
+
+```
+
+To map, we consider batch-corrected PC coordinates. First, to mapping biases that may be driven by the presence of a different number of cells from each timepoint, we randomly downsampled the number of cells in the atlas at each timepoint to 10,000 cells, including doublets and stripped nuclei. Note that the E6.5 and E6.75 timepoints have fewer than 10,000 cells in total; for these timepoints, all cells were retained. However, given that the chimeras are from the E7.5 and E8.5 timepoints, it is unlikely that cells will map to these timepoints anyway.
+
+To remove batch-effects from the data that may compromise mapping, we first compute a shared set of 50 PCs including all cells from the atlas and all cells from the chimeras. Within this space, we then batch correct exclusively the atlas cells, using the same procedure as in the atlas processing itself, in order to provide an accurate and batch-effect free reference that exists within the same space as the chimera cells. We then map each of the chimera samples to this atlas separately, again using the same `fastMNN` approach. 
+
+For each cell in each chimera sample, we record the ten closest neighbours in the atlas data. We define the mapped celltype and mapped timepoint as the modal value of the atlas cells in these 10 neighbours. Where there is a tie for the modal celltype or timepoint, the mapped celltype or timepoint is decided by considering the closest cell in the atlas of the tied celltypes or timepoints.
+
+```{r functions}
+getmode <- function(v, dist) {
+  tab = table(v)
+  #if tie, break to shortest distance
+  if(sum(tab == max(tab)) > 1){
+    tied = names(tab)[tab == max(tab)]
+    sub = dist[v %in% tied]
+    names(sub) = v[v %in% tied]
+    return(names(sub)[which.min(sub)])
+  } else {
+    return(names(tab)[which.max(tab)])
+  }
+}
+
+mnnMap = function(atlas_pca, atlas_meta, map_pca, map_meta, k_map = 10){
+  require(kmknn)
+  require(scran)
+  
+  correct = fastMNN(atlas_pca, map_pca, pc.input = TRUE)$corrected
+  atlas = 1:nrow(atlas_pca)
+  correct_atlas = correct[atlas,]
+  correct_map = correct[-atlas,]
+  
+  knns = kmknn::queryKNN(correct_atlas, correct_map, k = k_map, get.index = TRUE, get.distance = FALSE)
+  
+  #get closest k matching cells
+  k.mapped = t(apply(knns$index, 1, function(x) atlas_meta$cell[x]))
+  celltypes = t(apply(k.mapped, 1, function(x) atlas_meta$celltype[match(x, atlas_meta$cell)]))
+  stages = t(apply(k.mapped, 1, function(x) atlas_meta$stage[match(x, atlas_meta$cell)]))
+  celltype.mapped = apply(celltypes, 1, function(x) getmode(x, 1:length(x)))
+  stage.mapped = apply(stages, 1, function(x) getmode(x, 1:length(x)))
+  
+  out = lapply(1:length(celltype.mapped), function(x){
+    list(cells.mapped = k.mapped[x,],
+         celltype.mapped = celltype.mapped[x],
+         stage.mapped = stage.mapped[x])
+  })
+  
+  names(out) = map_meta$cell
+  
+  return(out)
+  
+}
+
+#meta MUST have a cell column, celltype column and a stage column, spelled exactly like that
+mapWrap = function(atlas_sce, atlas_meta, map_sce, map_meta, k = 10, return.list = FALSE){
+  require(scran)
+  #prevent duplicate rownames
+  colnames(map_sce) = paste0("map_", colnames(map_sce))
+  map_meta$cell = paste0("map_", map_meta$cell)
+  
+  big_sce = scater::normalize(cbind(atlas_sce, map_sce))
+  hvgs = getHVGs(big_sce)
+  big_pca = prcomp_irlba(t(logcounts(big_sce[hvgs,])), n = 50)$x
+  rownames(big_pca) = colnames(big_sce) 
+  atlas_pca = big_pca[1:ncol(atlas_sce),]
+  map_pca = big_pca[-(1:ncol(atlas_sce)),]
+  
+  #correct the atlas first
+  order_df = atlas_meta[!duplicated(atlas_meta$sample), c("stage", "sample")]
+  order_df$ncells = sapply(order_df$sample, function(x) sum(atlas_meta$sample == x))
+  order_df$stage = factor(order_df$stage, 
+                          levels = rev(c("E8.5", 
+                                         "E8.25", 
+                                         "E8.0", 
+                                         "E7.75", 
+                                         "E7.5", 
+                                         "E7.25", 
+                                         "mixed_gastrulation", 
+                                         "E7.0", 
+                                         "E6.75", 
+                                         "E6.5")))
+  order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+  order_df$stage = as.character(order_df$stage)
+  
+  set.seed(42)
+  atlas_corrected = doBatchCorrect(counts = logcounts(atlas_sce[hvgs,]), 
+                                   timepoints = atlas_meta$stage, 
+                                   samples = atlas_meta$sample, 
+                                   timepoint_order = order_df$stage, 
+                                   sample_order = order_df$sample, 
+                                   pc_override = atlas_pca)
+  
+  mapping = mnnMap(atlas_pca = atlas_corrected,
+                   atlas_meta = atlas_meta,
+                   map_pca = map_pca,
+                   map_meta = map_meta)
+  if(return.list){
+    return(mapping)
+  }
+  
+  cn = substr(names(mapping), 5, nchar(names(mapping))) # remove 
+  ct = sapply(mapping, function(x) x$celltype.mapped)
+  st = sapply(mapping, function(x) x$stage.mapped)
+  closest = sapply(mapping, function(x) x$cells.mapped[1])
+  
+  out = data.frame(cell = cn, celltype.mapped = ct, stage.mapped = st, closest.cell = closest)
+  return(out)
+  
+}
+
+
+
+```
+
+#Control mapping
+
+To verify the efficacy of the mapping strategy, we first consider a mapping using only the atlas cells. Specifically, we will remove a single E8.0 sample from the atlas, before remapping it back in. The correctness of celltype and stage-wise mapping can then be evaluated. Note that we perform a subsetting of the data to ensure all stages have the same number of cells, where possible, even with the exclusion of sample 16. By taking an entire sample, we can also avoid the possibility of batch-effects driving correctness of mapping (i.e. cells mapping very effectively, but only to other cells in their sample).
+
+```{r map-control, message = FALSE, warning = FALSE}
+
+subset_sce = scater::normalize(atlas_sce[,atlas_meta$sample != 16])
+subset_meta = atlas_meta[atlas_meta$sample != 16,]
+
+#Downsample
+set.seed(42)
+ncells = 10000
+keep = lapply(unique(subset_meta$stage), function(x){
+  if(x == "mixed_gastrulation"){
+    return(c())
+  } else if(sum(subset_meta$stage == x) < ncells) {
+    return(which(subset_meta$stage == x))
+  } else {
+    hits = which(subset_meta$stage == x)
+    return(sample(hits, ncells))
+  }
+})
+keep = do.call(c, keep)
+subset_sce = scater::normalize(subset_sce[,keep])
+subset_meta = subset_meta[keep,]
+
+#get the sample 34 cells
+map_sce = scater::normalize(atlas_sce[, atlas_meta$sample == 16])
+map_meta = atlas_meta[atlas_meta$sample == 16,]
+
+# control.mapping = mapWrap(subset_sce,
+#                           subset_meta,
+#                           map_sce,
+#                           map_meta,
+#                           return.list = TRUE)
+# 
+# saveRDS(control.mapping, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/mapping_control.rds")
+
+
+control.mapping = readRDS("/nfs/research1/marioni/jonny/chimera-wt/scripts/map/mapping_control.rds")
+saveRDS(map_meta, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/map_meta.rds")
+
+```
+
+Figure \@ref(fig:control-stage) shows the stages to which the sampled cells map to.
+
+```{r control-stage, fig.cap = "Stage mapping results", warning = FALSE, message = FALSE}
+
+celltype.mapped = sapply(control.mapping, function(x) x$celltype.mapped)
+stage.mapped = sapply(control.mapping, function(x) x$stage.mapped)
+sample.mapped = subset_meta$sample[match(sapply(control.mapping, function(x) x$cells.mapped[1]), subset_meta$cell)]
+
+tab =table(stage.mapped)
+tab = tab/sum(tab)
+
+p = ggplot(mapping = aes(x = names(tab), y = tab)) +
+  geom_bar(stat = "identity", fill = "black") +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Fraction of cells mapped")
+
+p
+
+ggsave(p, file ="/nfs/research1/marioni/jonny/chimera-wt/scripts/map/self_stage_mapped.pdf", width = 5, height = 4)
+
+frac_correct = sum(stage.mapped == "E8.0")/ length(stage.mapped)
+frac_adjacent = sum(stage.mapped %in% c("E8.25", "E8.0", "E7.75")) / length(stage.mapped)
+
+```
+
+`r format(frac_correct*100, digits = 3)`% of cells mapped to the correct timepoint, while `r format(frac_adjacent*100, digits = 3)` mapped within one timepoint.
+
+
+Figure \@ref(fig:control-celltype) shows the fraction of cells of each annotated celltype in the sampled cells (columns) that mapped to which celltypes in the atlas (rows).
+
+```{r control-celltype, fig.wide = TRUE, fig.height=8, fig.cap =  "The fraction of cells of each annotated celltype in the sampled cells (rows) that mapped to which celltypes in the atlas (columns) is shown."}
+
+lvls = unique(map_meta$celltype)
+tab = table(factor(celltype.mapped, levels = lvls), factor(map_meta$celltype, levels = lvls))
+cs = colSums(tab)
+# rs[rs == 0] = 1
+tab = sweep(tab, 2, cs, "/")
+# pheatmap(tab, cluster_rows = FALSE, cluster_cols = FALSE)
+ncells = sapply(rownames(tab), function(x) sum(map_meta$celltype == x))
+
+pdf = melt(tab)
+p = ggplot(pdf, aes(y = Var1, x = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = c(0,1), breaks = c(0,1), name = "Fraction\ncorrectly\nmapped") +
+  theme(axis.title = element_text(face = "bold"),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "Real celltype", y = "Mapped celltype") +
+  annotate(geom = "text", x = 1:length(ncells), label = ncells, y = length(ncells) + 1, angle = 90)
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/control_heatmap.pdf", width = 12, height = 10)
+
+nms = substr(names(celltype.mapped), 5, nchar(names(celltype.mapped)))
+frac_correct = frac_correct = sum(celltype.mapped == map_meta$celltype[match(nms, map_meta$cell)])/ length(celltype.mapped)
+
+
+```
+
+`r format(frac_correct*100, digits = 3)`% of cells mapped to the correct celltype.
+
+Figure \@ref(fig:sample-imbalance) shows the number of cells that mapped to each sample in the atlas. Notably, within a stage, samples with more cells had more cells mapped to them, consistent with an absence of batch-effect driven mapping.
+
+```{r sample-imbalance, fig.height = 6, fig.wide = TRUE, fig.cap = "The number of cells mapped to each sample is shown."}
+
+tab = table(sample.mapped)
+pdf = as.data.frame(tab)
+pdf$ncells = sapply(pdf$sample.mapped, function(x){
+  sum(subset_meta$sample == x)
+})
+
+pdf$stage = sapply(pdf$sample.mapped, function(x){
+  subset_meta$stage[match(x, subset_meta$sample)]
+})
+
+
+ggplot(pdf, aes(x = ncells, y = Freq, col = stage)) +
+  geom_point(size= 3) +
+  scale_colour_manual(values = stage_colours, labels = stage_labels, name = "") +
+  theme(panel.background = element_rect(fill = "lightgrey")) +
+  labs(x = "Number of cells in atlas sample", y = "Number of cells mapped to atlas sample")
+
+
+```
+
+#Chimera mapping
+
+```{r map, warning = FALSE}
+
+# mappings = lapply(unique(meta$sample), function(x){
+#   mapWrap(atlas_sce, atlas_meta, sce[-nrow(sce), meta$sample == x], meta[meta$sample == x,])
+# })
+# 
+# mappings = do.call(rbind, mappings)
+# 
+# saveRDS(mappings, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/mapping_chimera.rds")
+
+
+# mappings_list = lapply(unique(meta$sample), function(x){
+#   mapWrap(atlas_sce, atlas_meta, sce[-nrow(sce), meta$sample == x], meta[meta$sample == x,], return.list = TRUE)
+# })
+# 
+# mappings_list = do.call(c, mappings_list)
+# 
+# saveRDS(mappings_list, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/mapping_chimera_list.rds")
+
+
+
+mappings = readRDS("/nfs/research1/marioni/jonny/chimera-wt/scripts/map/mapping_chimera.rds")
+
+meta$stage.mapped = mappings$stage.mapped[match(meta$cell, mappings$cell)]
+meta$celltype.mapped = mappings$celltype.mapped[match(meta$cell, mappings$cell)]
+meta$closest.cell = mappings$closest.cell[match(meta$cell, mappings$cell)]
+
+
+```
+
+
+##Mapping results
+
+To which stages do the WT-cells map? This is shown in Figure \@ref(fig:stage-mapping).
+
+```{r stage-mapping, fig.wide = TRUE, fig.height=8, fig.cap = "Mapping of cells to atlas timepoints. A: Mapping of cells from all chimeras to timepoints. B: Mapping of cells in the first E7.5 chimera biological replicate, split by tomato status. C: Mapping of cells in the second E7.5 chimera biological replicate, split by tomato status. D: Mapping of cells in the E8.5 chimera, split by tomato status."}
+
+p1 = ggplot(mapping = aes(x = meta$stage.mapped, fill = meta$stage)) +
+  geom_bar(stat = "count", position = "dodge") +
+  scale_fill_manual(values=c("E8.5" = "dodgerblue", "E7.5" = "coral"), name = "Chimera\ntimepoint") +
+  labs(x = "Atlas stage", y = "# cells") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+  
+
+pdf1 = table(meta$stage.mapped[meta$sample %in% 1:2], meta$tomato[meta$sample %in% 1:2])
+pdf1 = as.data.frame(sweep(pdf1, 2, colSums(pdf1), "/"))
+
+p2 = ggplot(data = pdf1, mapping = aes(x = Var1, y = Freq, fill = Var2)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+                    labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+                    name = "") +
+  labs(x = "Atlas stage", y = "Fraction of cells") +
+  ggtitle("E7.5 chimera 1") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+
+
+pdf2 = table(meta$stage.mapped[meta$sample %in% 3:4], meta$tomato[meta$sample %in% 3:4])
+pdf2 = as.data.frame(sweep(pdf2, 2, colSums(pdf2), "/"))
+
+p3 = ggplot(data = pdf2, mapping = aes(x = Var1, y = Freq, fill = Var2)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+                    labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+                    name = "") +
+  labs(x = "Atlas stage", y = "Fraction of cells") +
+  ggtitle("E7.5 chimera 2") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+
+
+pdf3 = table(meta$stage.mapped[meta$sample %in% 5:6], meta$tomato[meta$sample %in% 5:6])
+pdf3 = as.data.frame(sweep(pdf3, 2, colSums(pdf3), "/"))
+
+p4 = ggplot(data = pdf3, mapping = aes(x = Var1, y = Freq, fill = Var2)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "black"), 
+                    labels = c("TRUE" = "Tomato+", "FALSE" = "Tomato-"),
+                    name = "") +
+  labs(x = "Atlas stage", y = "Fraction of cells") +
+  ggtitle("E8.5 chimera") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5)) +
+    scale_x_discrete(breaks = unique(meta$stage.mapped)[order(unique(meta$stage.mapped))], 
+                   drop = FALSE)
+
+plot_grid(p1,p2,p3,p4, labels = "AUTO")
+
+```
+
+Furthermore, to which celltypes do these cells contribute? This is shown in Figure \@ref(fig:celltype).
+
+```{r celltype, warning = FALSE, fig.wide = TRUE, fig.cap = "The fraction of cells mapping to each celltype from either genotype is shown.", fig.height = 10}
+
+pdfall = table(meta$celltype.mapped, meta$tomato)
+colnames(pdfall) = c("TomT", "TomF")[match(colnames(pdfall), c("TRUE", "FALSE"))]
+pdfall = sweep(pdfall, 2, colSums(pdfall), "/")
+pdfall = as.data.frame.matrix(pdfall)
+
+
+plegend = ggplot(data = pdfall, mapping = aes(x = TomT, y = TomF, col = rownames(pdfall))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Fraction of Tomato+ cells", y = "Fraction of Tomato- cells") +
+  ggtitle("all cells") +
+  scale_x_log10() +
+  scale_y_log10() +
+  guides(col = guide_legend(ncol = 5, override.aes = list(size = 5)))
+
+p1 = ggplot(data = pdfall, mapping = aes(x = TomT, y = TomF, col = rownames(pdfall))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+  ggtitle("all cells") +
+scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  theme(legend.position = "none")
+
+pdf1 = table(meta$celltype.mapped[meta$sample %in% 1:2], meta$tomato[meta$sample %in% 1:2])
+colnames(pdf1) = c("TomT", "TomF")[match(colnames(pdf1), c("TRUE", "FALSE"))]
+pdf1 = sweep(pdf1, 2, colSums(pdf1), "/")
+pdf1 = as.data.frame.matrix(pdf1)
+
+p2 = ggplot(data = pdf1, mapping = aes(x = TomT, y = TomF, col = rownames(pdf1))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+  ggtitle("E7.5 chimera 1") +
+scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  theme(legend.position = "none")
+
+
+
+pdf2 = table(meta$celltype.mapped[meta$sample %in% 3:4], meta$tomato[meta$sample %in% 3:4])
+colnames(pdf2) = c("TomT", "TomF")[match(colnames(pdf2), c("TRUE", "FALSE"))]
+pdf2 = sweep(pdf2, 2, colSums(pdf2), "/")
+pdf2 = as.data.frame.matrix(pdf1)
+
+p3 = ggplot(data = pdf2, mapping = aes(x = TomT, y = TomF, col = rownames(pdf2))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+  ggtitle("E7.5 chimera 2") +
+  scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  theme(legend.position = "none")
+
+
+pdf3 = table(meta$celltype.mapped[meta$sample %in% 5:6], meta$tomato[meta$sample %in% 5:6])
+colnames(pdf3) = c("TomT", "TomF")[match(colnames(pdf3), c("TRUE", "FALSE"))]
+pdf3 = sweep(pdf3, 2, colSums(pdf3), "/")
+pdf3 = as.data.frame.matrix(pdf3)
+
+p4 = ggplot(data = pdf3, mapping = aes(x = TomT, y = TomF, col = rownames(pdf3))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+  ggtitle("E8.5 chimera") +
+scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  theme(legend.position = "none")
+
+plot_fig = ggplot(data = pdf3, mapping = aes(x = TomT, y = TomF, col = rownames(pdf3))) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = c(celltype_colours, "Doublet" = "black", "Stripped" = "black"), name = "") +
+  labs(x = "Tomato+ cells", y = "Tomato- cells") +
+  ggtitle("E8.5 chimera") +
+  scale_x_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  scale_y_log10(breaks = c(0.1, 0.01, 0.001, 0.0001), labels = c("10%", "1%", "0.1%", "0.01%")) +
+  theme(legend.position = "none") +
+   # coord_cartesian(xlim = c(0.0003, 0.15), ylim = c(0.0003, 0.15)) +
+  coord_fixed(xlim = c(0.0003, 0.25), ylim = c(0.0003, 0.25))
+
+
+p = plot_grid(plot_grid(p1, p2, p3, p4), get_legend(plegend), rel_heights = c(0.66, 0.33), ncol = 1)
+
+p
+
+save_plot(p, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/celltype_scatterplot.pdf", base_width = 8, base_height =12)
+
+ggsave(plot_fig, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/celltype_scatterplot_8.5.pdf", width = 5, height = 5)
+
+```
+
+##Differences in stage mapping by celltype
+
+How can we compare the cells in the chimeras? In Figure \@ref(fig:ct-stage), we have calculated the average developmental delay within each celltype. Specifically, the mean difference in mapped stage is shown between Tomato+ and Tomato- cells, considering cells in each celltype separately. This was clalculated only for E8.5 here.
+
+```{r ct-stage, fig.wide = TRUE, warning = FALSE, fig.cap = "Mean differences in mapped stage per celltype is shown for E8.5. Only celltypes with at least 10 cells in each genotype were retained."}
+
+meta_late = meta[meta$stage == "E8.5" & !meta$celltype.mapped %in% c("Doublet", "Stripped"),]
+
+tab = table(meta_late$celltype.mapped, meta_late$tomato)
+cts = rownames(tab)[apply(tab, 1, min) > 10]
+
+
+day = as.numeric(substr(as.character(meta_late$stage.mapped), 2, nchar(as.character(meta_late$stage.mapped))))
+
+mean.day = aggregate(formula = day ~ meta_late$celltype.mapped + meta_late$tomato, FUN = mean)
+colnames(mean.day) = c("celltype", "tomato", "day")
+
+
+
+mean.day = mean.day[mean.day$celltype %in% cts,]
+delta_mean = sapply(cts, function(x) mean.day$day[mean.day$celltype == x][1] - mean.day$day[mean.day$celltype == x][2])
+delta_mean = delta_mean * 24
+names(delta_mean) = cts
+
+tests = sapply(cts, function(x){
+  wilcox.test(day[meta_late$celltype.mapped == x & meta_late$tomato], day[meta_late$celltype.mapped == x & !meta_late$tomato])$p.value
+})
+
+fdr = p.adjust(tests, method = "fdr")
+names(fdr) = cts
+target = fdr[fdr < 0.1]
+annot = data.frame(celltype = names(target), delta_mean = delta_mean[names(target)])
+annot$ypos = annot$delta_mean + 0.15 * sign(annot$delta_mean) - 0.1
+
+p = ggplot(mapping = aes(x = names(delta_mean), y = delta_mean, fill = names(delta_mean))) +
+  geom_bar(stat = "identity", position = "dodge", col = "grey10") +
+  scale_fill_manual(values = celltype_colours) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), axis.title.x = element_blank(), legend.position = "none") +
+  labs(y = "Mutant delay (hours)") +
+  geom_text(data = annot, mapping = aes(x = celltype, y = ypos, label = rep("*", nrow(annot))), inherit.aes = FALSE, size = 8)
+
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/chimera-wt/scripts/map/plots/delay.pdf", width = 4, height = 5)
+
+```
+
+## Doublet rates
+
+The fraction of doublets in each of the 10X samples is shown in Figure \@ref(fig:doublets)
+
+```{r doublets, fig.cap = "Number of doublets called in chimera samples"}
+
+pdf = data.frame(ncells = sapply(1:6, function(x) sum(meta$sample == x)),
+                 fracdoubs = sapply(1:6, function(x) sum(meta$celltype.mapped == "Doublet" &
+                                                           meta$sample == x) / sum(meta$sample == x)))
+
+ggplot(pdf, aes(x = ncells, y= fracdoubs)) +
+  geom_point() +
+  scale_y_continuous(breaks = c(0,0.05,0.1), labels = c("0%", "5%", "10%"), limits = c(0,0.1)) +
+  labs(x = "Cell in sample", y = "Fraction doublets")
+
+```
+
+Moreover, do the cells that were mapped as doublets look like doublets? To evaluate this, we calculate the doublet density score (`scran::doubletCells`) and compare between those cells that were and were not mapped to doublets. The result is shown in Figure \@ref(fig:doub-score)
+
+```{r doub-score, fig.cap = "Doublet scores for singlet- or doublet-mapped cells."}
+
+scores = lapply(unique(meta$sample), function(x){
+  doubletCells(scater::normalize(sce[,meta$sample == x]), approximate = TRUE)
+})
+
+scores = do.call(c, scores)
+
+meta$doub.density = scores
+
+ggplot(meta, aes(x = celltype.mapped == "Doublet", y = doub.density + 1)) +
+  geom_boxplot() +
+  scale_y_log10(name = "Doublet density + 1")+
+  scale_x_discrete(labels = c("TRUE" = "Doublet-mapped", "FALSE" = "Singlet-mapped"), name = "")
+
+```
+
+#Save updated metadata
+
+```{r savemeta}
+
+write.table(meta, file = "/nfs/research1/marioni/jonny/chimera-wt/data/meta.tab", row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

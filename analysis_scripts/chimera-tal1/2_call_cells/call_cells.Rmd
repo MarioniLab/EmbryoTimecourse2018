@@ -1,0 +1,185 @@
+---
+title: "Tal1 chimera: Cell calling"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+---
+
+```{r seed}
+set.seed(42)
+```
+
+#Introduction
+
+CellRanger identifies as true cells those barcodes with **total UMI count of $\geq$ 10% of the 99th percentile of the expected recovered cells** (which is by default 3000). What does this mean? A graphical summary is shown in Figure \@ref(fig:summary-tenx).
+
+```{r summary-tenx, message = FALSE, fig.cap="Summary of CellRanger cell calling. CellRanger first ranks barcodes by their total UMI count, and identifies the UMI count of Nth barcode, where N is the expected number of recovered cells provided by the user (red). It then identifies the UMI count of the 99th percentile of these barcodes (green), and calls any barcode with a UMI count of more than 10% the size of this value (blue)."}
+library(Matrix)
+library(ggplot2)
+
+samp.num = 2
+exp_design = read.table("/nfs/research1/marioni/jonny/chimera-tal1/raw/meta/exp_design.csv", sep = ",", header = TRUE)
+raw_counts = readMM(paste0("/nfs/research1/marioni/jonny/chimera-tal1/cellranger_out/sample_",
+                           samp.num, 
+                           "/outs/raw_gene_bc_matrices/mm10_tomato/matrix.mtx"))
+libs = Matrix::colSums(raw_counts)
+libs = libs[order(libs, decreasing = TRUE)]
+expected = exp_design[samp.num,"expected"]
+quant = round(quantile(1:expected, 0.01))
+min = libs[quant]/10
+min.cell = max(which(libs > min))
+
+
+p = ggplot(mapping=aes(x = 1:length(libs), y = libs)) +
+  geom_path() +
+  scale_x_log10(name = "Cell ranking", 
+                breaks = c(1, 10, 100, 1000, 10000, 100000),
+                labels = c("1", "10", "100", "1,000", "10,000", "100,000")) +
+  scale_y_log10(name = "Number of UMIs") +
+  theme_bw() +
+  geom_point(mapping = aes(x = expected, y = libs[expected]), col = "red", size = 2) +
+  geom_segment(mapping= aes(x = expected, xend = expected, y = libs[expected], yend = libs[quant]),
+               arrow = arrow(length = unit(0.1, "inches")),
+               col = "red") +
+  geom_point(mapping = aes(x = quant, y = libs[quant]), col = "seagreen4", size = 2) +
+  geom_hline(yintercept = libs[quant], col = "seagreen3", lty = "twodash") +
+  geom_point(mapping = aes(x = min.cell, y= libs[min.cell]), col = "blue", size = 2) +
+  geom_hline(yintercept = libs[min.cell], col = "cornflowerblue", lty = "twodash") +
+  geom_segment(mapping= aes(x = quant, xend = quant, y = libs[quant], yend = libs[min.cell]),
+               arrow = arrow(length = unit(0.1, "inches")),
+               col = "cornflowerblue") +
+  geom_label(mapping = aes(x = 3, y = 8000, label = "10%"), fill = "cornflowerblue", alpha = 0.9) +
+  geom_label(mapping = aes(x = expected*8, y = libs[expected], label = "Expected recovered"), fill = "red", alpha = 0.9) +
+  geom_label(mapping = aes(x = expected*3, y = max(libs), label = "99th %ile"), fill = "seagreen3", alpha = 0.9)
+
+suppressWarnings(plot(p))
+
+```
+
+Note that the CellRanger algorithm selects a cutoff in what appears to be a relatively arbitrary point - it has completely missed the "knee". 
+
+Irrespective of hitting the knee, UMI count is not necessarily the most effective way to identify cells in a sample. Given that the capture efficiency of individual droplets is very variable, a well-captured selection of background RNAs (from lysed cells etc) could feasibly be larger than a poorly-captured set of RNAs from a real cell. Moreover, cells with lower amounts of RNA may also look like background signal based on size alone.
+
+In order to tackle this, we use the `emptyDrops` method for cell selection.
+
+This method identifies a background, ambient expression profile that represents cell-free RNA (from barcode libraries of fewer than 100 UMIs). A null model is established for empty droplets: a poisson sampling from the background RNA. Cells should show  divergent expression profiles from the background levels. The deviance of each observed barcode library from the null model is recorded, tested against simulated null distributions. Cells are called where $q<0.01$ (where $q$ is an FDR-corrected p-value).  Additionally, cells above the "knee" are all retained for analysis.
+
+This method operates on a sample-by-sample basis, as different samples should have different distributions of background RNA. Now we load the data.
+
+```{r load, message = FALSE}
+
+library(DropletUtils)
+library(ggplot2)
+library(Matrix)
+library(BiocParallel)
+ncores = 4
+mcparam = MulticoreParam(workers = ncores)
+register(mcparam)
+library(knitr)
+library(reshape2)
+
+mtx_loc = paste0("/nfs/research1/marioni/jonny/chimera-tal1/cellranger_out/sample_", 1:4, "/outs/raw_gene_bc_matrices/mm10_tomato/matrix_unswapped.mtx")
+bc_loc = paste0("/nfs/research1/marioni/jonny/chimera-tal1/cellranger_out/sample_", 1:4, "/outs/raw_gene_bc_matrices/mm10_tomato/barcodes_unswapped.tsv")
+
+matrices = bplapply(mtx_loc, readMM)
+bcs = bplapply(bc_loc, function(x) read.table(x, header = FALSE, stringsAsFactors = FALSE)[,1])
+
+#correct barcode sample number to match 10X style
+for(i in 1:length(bcs)){
+  bcs[[i]] = paste0(bcs[[i]], "-", i)
+}
+
+
+```
+
+To calculate the background RNA distribution, we sum the counts in all droplets with fewer than 60 UMIs. Figure \@ref(fig:investigate-edrops) shows that the largest contributions to the background vector derive from small (~40 UMIs) or very small (<5 UMIs) barcodes.
+
+```{r investigate-edrops, fig.cap = "Background vector contributions from barcode libraries of different sizes. Sample 3 is shown, chosen arbitratily."}
+
+
+mat = matrices[[3]]
+targets = mat[, Matrix::colSums(mat)!=0 & Matrix::colSums(mat) < 60]
+sums = Matrix::colSums(targets)
+reads = as.matrix(table(sums) * as.numeric(names(table(sums))))
+
+# ggplot(data.frame(lib = sums), aes(x = lib)) +
+#   geom_histogram(binwidth = 1) +
+#   theme_bw() +
+#   labs(x = "UMI count")
+
+ggplot(data.frame(lib = reads, n = as.numeric(rownames(reads))), aes(x = n, y= lib)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  labs(x = "Barcode library UMI count", y = "Total contribution to background vector") +
+  scale_x_continuous(breaks = seq(0,100, 5))
+
+
+
+bg_vec = Matrix::rowSums(targets)
+
+
+```
+
+The total background vector consists of `r format(sum(reads), big_mark = ",")` UMI counts.
+
+
+#Calling
+
+Here, we make the calls. The number of called cells per sample is indicated in Table \@ref(tab:save).
+
+We additionally exclude small/low quality (<5000 UMI) barcodes from cell calling.
+
+
+```{r all-call}
+
+exp_design = read.table("/nfs/research1/marioni/jonny/chimera-tal1/raw/meta/exp_design.csv", sep = ",", header = TRUE)
+
+
+set.seed(42)
+#do call
+outs = lapply(matrices, emptyDrops, niters = 200000, ignore = 4999, BPPARAM = mcparam, lower = 60)
+
+```
+
+
+```{r subset-cells}
+#identify cells
+sigs = lapply(outs, function(x) x$FDR <= 0.01 & !is.na(x$FDR))
+
+#subset the cells
+cells = lapply(1:length(matrices), function(i) matrices[[i]][, sigs[[i]]])
+barcodes = lapply(1:length(bcs), function(i) bcs[[i]][sigs[[i]]])
+
+#append
+counts = do.call(cbind, cells)
+barcodes = do.call(c, barcodes)
+
+```
+
+```{r save}
+#save
+dump_var = writeMM(counts, file = "/nfs/research1/marioni/jonny/chimera-tal1/data/raw_counts.mtx")
+write.table(barcodes, file = "/nfs/research1/marioni/jonny/chimera-tal1/data/barcodes.tsv", col.names = FALSE, row.names = FALSE, quote = FALSE)
+dump_var = file.copy(from = "/nfs/research1/marioni/jonny/chimera-tal1/cellranger_out/sample_1/outs/raw_gene_bc_matrices/mm10_tomato/genes.tsv", 
+                     to = "/nfs/research1/marioni/jonny/chimera-tal1/data/genes.tsv",
+                     overwrite = TRUE)
+
+summary_df = data.frame(sample = 1:length(matrices), value = sapply(cells, ncol))
+summary_df$stage = exp_design$stage[match(summary_df$sample, exp_design$sample)]
+
+tab = acast(summary_df, sample ~ stage, fill = 0)
+tab = rbind(tab, colSums(tab))
+rownames(tab)[nrow(tab)] = "Total"
+
+kable(tab, caption = "Number of called cells")
+
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

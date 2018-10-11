@@ -1,0 +1,455 @@
+---
+title: "Cell Quality Control"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+
+```{r load_data, message=FALSE}
+
+library(Matrix)
+library(biomaRt)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(viridis)
+
+#core functions inc. colour palette
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+
+
+counts = readMM("/nfs/research1/marioni/jonny/embryos/data/raw_counts.mtx")
+holder= file.copy("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_1/outs/raw_gene_bc_matrices/mm10/genes.tsv",
+                  "/nfs/research1/marioni/jonny/embryos/data/genes.tsv")
+genes = read.table("/nfs/research1/marioni/jonny/embryos/data/genes.tsv", stringsAsFactors = F)
+barcodes = read.table("/nfs/research1/marioni/jonny/embryos/data/barcodes.tsv", stringsAsFactors = F)[,1]
+exp_design = read.table("/nfs/research1/marioni/jonny/embryos/raw/meta/sample_stage_map.csv", sep = ",", header = TRUE)
+
+```
+
+#Comparing sequencing depth
+
+## UMI counts
+
+Our experimental design is from three batches - samples 1-11 in batch 1, samples 12-28 in batch 2, and samples 29-37 in batch 3. The number of UMIs per called cell is shown in Figure \@ref(fig:plot-size), split according to batch. There is no obvious difference.
+
+
+```{r plot-size, fig.cap="Barcode UMI counts for sequencing batches"}
+
+lib.sizes = Matrix::colSums(counts)
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+samples = sapply(split_bc, function(x) x[2])
+
+batch = sapply(samples, function(x){
+  if(x %in% 1:11){
+    return(1)
+  } else if(x %in% 12:28){
+    return(2)
+  } else{
+    return(3)
+  }
+})
+
+plot_df = data.frame(lib = lib.sizes, sample = samples, batch = batch)
+
+
+ggplot(plot_df, aes (x = factor(batch), y = lib)) +
+  geom_boxplot() +
+  theme_bw() + 
+  scale_y_log10(breaks = c(1000, 5000, 10000, 50000, 100000), 
+                             labels = c("1,000", "5,000", "10,000", "50,000", "100,000")) +
+  labs(x = "Batch", y = "Number of UMIs")
+
+
+```
+
+
+## Sequencing saturation
+
+The 10X system uses unique molecular identifiers (UMIs). By considering how frequently the same UMIs have been sequenced, the saturation of sequencing can be estaimted (i.e. what % of captured molecules have been sequenced). Sample-wise median UMI counts are plotted alongside the sequencing saturations estimated by CellRanger in Figure \@ref(fig:sat).
+
+```{r sat, fig.cap="Sequencing saturations for each sample."}
+
+pdf = data.frame(sample = seq_along(unique(exp_design$sample)),
+                 med_lib = sapply(seq_along(unique(exp_design$sample)), function(x) median(lib.sizes[samples == x])),
+                 mean_lib = sapply(seq_along(unique(exp_design$sample)), function(x) mean(lib.sizes[samples == x])),
+                 stage = sapply(seq_along(unique(exp_design$sample)), function(x) exp_design$stage[match(x, exp_design$sample)]), 
+                 saturation = sapply(seq_along(unique(exp_design$sample)), function(x){
+                   tab = read.table(paste0("/nfs/research1/marioni/jonny/embryos/cellranger_out/sample_",
+                                                                         x,
+                                                                         "/outs/metrics_summary.csv"),
+                                    header = TRUE, 
+                                    sep = ",")
+                   stat = tab[1, "Sequencing.Saturation"]
+                   return(as.numeric(substr(stat, 1, 4)))
+                 }))
+
+colors = c(brewer_pal(palette = "Spectral")(length(unique(pdf$stage))-1), "lightgrey")
+
+ggplot(pdf, aes(x = med_lib, y = saturation, label = 1:nrow(pdf), fill = stage)) +
+  geom_label(alpha = 0.8) +
+  labs(x = "Median library size", y = "Sequencing Saturation (%)") +
+  theme_bw() +
+  scale_fill_manual(values = colors)
+
+```
+
+
+
+```{r plot_change, fig.cap="Cells dropped according to UMI threshold"}
+
+plot_change = function(barcodes, logical_keep){
+  split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+  samples = sapply(split_bc, function(x) x[2])
+  
+  pdf = data.frame(Sample = unique(samples),
+                   Total = sapply(unique(samples), function(x) sum(samples == x)),
+                   Dropped = sapply(unique(samples), function(x) sum(!logical_keep[samples == x])),
+                   Retained = sapply(unique(samples), function(x) sum(logical_keep[samples == x])))
+  
+  p = ggplot(data = pdf) +
+          geom_bar(mapping = aes(y = Total, 
+                                 x = factor(Sample, levels = unique(samples))), 
+                   fill = "darkgrey",
+                   stat = "identity") +
+          geom_bar(mapping = aes(y = Retained, 
+                                 x = factor(Sample, levels = unique(samples))), 
+                   fill = "coral",
+                   stat = "identity") +
+          geom_segment(mapping = aes(y = Total, 
+                                     yend = Retained, 
+                                     x = factor(Sample, levels = unique(samples)),  
+                                     xend = factor(Sample, levels = unique(samples))),
+                       arrow = arrow(length = unit(0.1, "inches"))) +
+          theme_bw() +
+          labs(y = "Number of cells", x= "Sample")
+  
+  pdf = rbind(pdf, data.frame(Sample = "Total", 
+                              Total = length(barcodes), 
+                              Dropped = sum(!logical_keep), 
+                              Retained = sum(logical_keep)))
+    
+  return(list(plot = p, df = pdf))
+}
+
+
+```
+
+# Cell complexity thresholding
+
+We remove cell libraries that have very low complexity: these are likely to be artefacts. Specifically, droplets that express fewer than 1000 different genes are removed.
+
+```{r gene-plot, fig.cap = "Cell library complexities are shown. Black cells are retained, and grey cells are excluded."}
+
+lib.sizes = Matrix::colSums(counts)
+
+ngenes = Matrix::colSums(counts > 0)
+
+
+qplot(lib.sizes, ngenes, col = ifelse(ngenes < 1000, "drop", "keep")) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "UMI count", y = "Number of expressed genes") +
+  scale_color_manual(values = c("drop" = "grey50", "keep" = "black"), name = "")
+
+```
+
+```{r gene-rem-plot, fig.cap = "Cells dropped according to low library complexity thresholding."}
+gene_drop = plot_change(barcodes, logical_keep = ngenes > 1000 )
+
+print(gene_drop$plot)
+
+```
+
+
+```{r gene-rem-tab}
+
+
+kable(gene_drop$df, caption = "Cells dropped according to low library complexity thresholding.", row.names = FALSE)
+
+
+counts = counts[, ngenes > 1000]
+barcodes = barcodes[ngenes > 1000]
+ngenes = ngenes[ngenes > 1000]
+
+
+```
+
+# Mitochondrial gene expression
+
+Another useful QC metric is mitochondrial gene fraction: high measurements of mitochrondrial gene expression may indicate stressed cells, or incomplete lysis.
+
+To identify a threshold for cell exclusion, we assume that the "standard" set of mitchondrial UMI fractions can be modelled by a normal distribution. We centre this distribution on the median value, with median absolute deviation estimated variance. We then consider cells outlying if their mitochondrial UMI fraction has a corresponding FDR-adjusted $p<0.05$, and exclude these. The cutoff is shown graphically in Figure \@ref(fig:mt-frac), with quantification of cell exclusion in Figure \@ref(fig:mt-rem-plot) and Table \@ref(tab:mt-rem-tab)
+
+```{r mt-frac, fig.cap = "Mitochondrial read fractions"}
+
+lib.sizes = colSums(counts)
+
+mouse_ensembl = useMart("ensembl")
+mouse_ensembl = useDataset("mmusculus_gene_ensembl", mart = mouse_ensembl)
+
+gene_map = getBM(attributes=c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = genes[,1], mart = mouse_ensembl)
+mt.counts = counts[which(genes[,1] %in% gene_map$ensembl_gene_id[gene_map$chromosome_name=="MT"]),]
+mt.fraction = colSums(mt.counts)/lib.sizes
+
+#fit median-centered, MAD-variance normal 
+#crass 5%+
+# mt.lim = qnorm(0.95, mean = median(mt.fraction), sd = mad(mt.fraction))
+#fdr-corrected outliers
+#technically this should be a pt, but the df. is astronomically high so this is essentially the same
+mt.p = pnorm(mt.fraction, mean = median(mt.fraction), sd = mad(mt.fraction), lower.tail = FALSE)
+mt.lim = min(mt.fraction[which(p.adjust(mt.p, method = "fdr") < 0.05)])
+
+qplot(lib.sizes, mt.fraction, col = ifelse(mt.fraction>mt.lim, "drop", "keep")) +
+  scale_x_log10() +
+  labs(x = "UMI count", y = "MT read fraction") +
+  scale_color_manual(values = c("drop" = "grey50", "keep" = "black"), name = "")
+
+```
+
+```{r mt-rem-plot, fig.cap = "Cells dropped according to mitochondrial fraction threshold"}
+mt_drop = plot_change(barcodes, logical_keep = mt.fraction<mt.lim )
+
+print(mt_drop$plot)
+
+```
+
+
+```{r mt-rem-tab}
+
+
+kable(mt_drop$df, caption = "Cells dropped according to mitochondrial fraction threshold", row.names = FALSE)
+
+
+counts = counts[, mt.fraction < mt.lim]
+barcodes = barcodes[mt.fraction < mt.lim]
+mt.fraction = mt.fraction[mt.fraction < mt.lim]
+
+
+```
+
+The cutoff was at `r format(mt.lim*100, digits=3, nsmall = 2)`%
+
+#Number of detected genes
+
+The relationship between the number of UMIs per cell and the number of detected genes per cell is shown in Figure \@ref(fig:patterns). Note that these are well behaved between samples.
+
+```{r patterns, fig.width = 10, fig.height = 20, fig.wide=TRUE, fig.cap="Sample-wise plots of retained libraries"}
+
+lib.sizes = colSums(counts)
+n.genes = colSums(counts>0)
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+bcs = sapply(split_bc, function(x) x[1])
+samples = sapply(split_bc, function(x) x[2])
+
+plot_df = data.frame(lib = lib.sizes, genes = n.genes, sample = samples)
+plot_df = plot_df[sample(nrow(plot_df), nrow(plot_df), replace = FALSE),]
+
+p = ggplot(plot_df, aes(x = lib, y = genes)) +
+  geom_point(alpha = 0.5) +
+  scale_colour_Publication() +
+  scale_y_log10() +
+  scale_x_log10() +
+  theme_bw() +
+  facet_wrap(~factor(sample, levels = unique(sample)[order(nchar(unique(as.character(sample))), unique(sample))]), ncol = 3) +
+  labs(x = "Number of UMIs", y = "Number of detected genes")
+
+suppressWarnings(plot(p))
+
+```
+
+You may note a population of cells in Sample 17 which show considerably lower complexity than those in other samples. These are blood cells, as is shown via expression of the haemoglobin gene *Hbb-bh1* in Figure \@ref(fig:haem). These cells express very high levels of the haemoglobin genes, which effectively reduces their transcriptome complexity for a given number of captured RNAs.
+
+```{r haem, fig.cap = "Expression of Hbb-bh1 shown for cells of different sizes and complexities."}
+
+lib.sizes = colSums(counts)
+n.genes = colSums(counts>0)
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+bcs = sapply(split_bc, function(x) x[1])
+samples = sapply(split_bc, function(x) x[2])
+
+plot_df = data.frame(lib = lib.sizes, genes = n.genes, sample = samples)
+plot_df = plot_df[plot_df$sample == 17,]
+plot_df$count = as.numeric(counts[match("Hbb-bh1", genes[,2]), samples == 17])
+
+ggplot(plot_df, aes(x = lib, y = genes, col = log2(count+1))) +
+  geom_point() +
+  scale_color_viridis(name = "Hbb-bh1\nlog2\ncount") +
+  labs(x = "Number of UMIs", y = "Number of detected genes")
+
+```
+
+#Inter-sample comparisons
+
+The distributions of UMI counts (Figure \@ref(fig:sample-box)) and mitchondrial read fractions (Figure \@ref(fig:mt-box)) are shown between the samples, below.
+
+```{r sample-box, fig.cap = "Sample-wise UMI count distributions"}
+
+batch = ifelse(as.numeric(samples) <= 11,
+               1,
+               2)
+
+p = ggplot(data.frame(lib = lib.sizes, sample = samples), aes (x = factor(sample, levels = unique(sample)), 
+                                                           y = lib.sizes, fill = factor(batch))) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_log10() +
+  labs(x = "Sample", y = "Number of UMIs")+
+  scale_color_brewer(palette = "Set1", name = "Sequencing\nbatch")
+
+suppressWarnings(plot(p))
+ 
+```
+
+```{r mt-box, fig.cap = "Sample-wise mitochrondrial UMI distributions"}
+p = ggplot(data.frame(mt = mt.fraction, sample = samples), aes (x = factor(sample, levels = unique(sample)), 
+                                                           y = mt, fill = factor(batch))) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_log10() +
+  labs(x = "Sample", y = "Mitochondrial gene fraction") +
+  scale_color_brewer(palette = "Set1", name = "Sequencing\nbatch")
+
+suppressWarnings(plot(p))
+
+```
+
+A similar comparison is now made across stage, considering the distributions of library size (Figure \@ref(fig:stage-lib)) and mitochondrial read fractions (Figure \@ref(fig:stage-mt)).
+
+```{r stage-lib, fig.cap = "Stage-wise UMI count distributions"}
+
+stage_match = read.table("/nfs/research1/marioni/jonny/embryos/raw/meta/sample_stage_map.csv", sep = ",", header = TRUE)
+
+pdf = data.frame(mt = mt.fraction, sample = samples, lib.size = lib.sizes, stage = stage_match$stage[match(samples, stage_match$sample)])
+
+p = ggplot(pdf, aes(x = factor(stage), y= lib.size)) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_log10() +
+  labs(x = "Stage", y = "Number of UMIs")
+
+suppressWarnings(plot(p))
+```
+
+```{r stage-mt, fig.cap = "Sample-wise mitochondrial UMI distributions"}
+
+p = ggplot(pdf, aes(x = factor(stage), y=mt.fraction)) +
+  geom_boxplot() +
+  theme_bw() +
+  scale_y_log10() +
+  labs(x = "Stage", y = "Mitchondrial gene fraction")
+
+suppressWarnings(plot(p))
+
+```
+
+
+#Remove sample 11
+
+Clearly, something has gone wrong with sample 11, as so few cells were captured. We therefore remove all cells from this sample, as it has likely entirely QC-failed.
+
+```{r remove_11}
+
+counts = counts[ , samples != 11]
+barcodes = barcodes[samples != 11]
+```
+
+#Make metadata
+
+We now save a table of metadata, recording for each cell its barcode, sample, developmental stage and sequencing batch. Additionally, we store Thieler stage (TS) information for each cell. Specifically, we label E6.5-E6.75 cells as TS9, E7.0-E7.25 as TS10, E7.5-E7.75 as TS11, and E8.0-E8.5 as TS12. Note that two samples were formed of embryos of a variety of stages. These are labelled as a "mixed_gastrulation" timepoint, at Theiler stage "TS9-10"
+
+```{r meta}
+
+
+split_bc = strsplit(as.character(barcodes), "-", fixed = T)
+bcs = sapply(split_bc, function(x) x[1])
+samples = sapply(split_bc, function(x) x[2])
+
+
+
+meta = data.frame(cell = paste0("cell_", 1:ncol(counts)),
+                  barcode = bcs,
+                  sample = as.numeric(samples),
+                  stage = stage_match$stage[match(samples, stage_match$sample)],
+                  batch = stage_match$batch[match(samples, stage_match$sample)])
+
+meta$theiler = sapply(meta$stage, function(x){
+  if(x == "mixed_gastrulation"){
+    return("TS9-10")
+  } else if(x %in% c("E6.5", "E6.75")){
+    return("TS9")
+  } else if(x %in% c("E7.0", "E7.25")){
+    return("TS10")
+  } else if(x %in% c("E7.5", "E7.75")){
+    return("TS11")
+  } else if(x %in% c("E8.0", "E8.25", "E8.5")){
+    return("TS12")
+  } else {
+    return(NA)
+  }
+})
+
+```
+
+This procedure has left us with `r ncol(counts)` cells, distributed between samples and stages as shown in Table \@ref(tab:kab).
+
+```{r kab}
+tab = as.matrix(table(meta$sample, meta$stage))
+
+new_rownames = c("Total", rownames(tab))
+tab = rbind(sapply(colnames(tab), function(x) sum(meta$stage == x)),
+            tab)
+rownames(tab) = new_rownames
+
+pt = kable(tab, caption = "Number of cells retained for analysis")
+pt
+
+
+```
+
+#Expected vs. retained cells
+
+10X provides estimates of the number of cells to expect to capture, given an input number of cells. Our final number of cells and the expected number of recovered cells is shown in Figure \@ref(fig:exp-obs).
+
+```{r exp-obs, fig.cap = "Expected vs observed number of recovered cells. The black line has gradient 1, intercept 0."}
+
+exp = read.table("/nfs/research1/marioni/jonny/embryos/raw/meta/exp_cells.tab", sep = "\t", header = TRUE)
+exp = exp[exp$sample!=11,]
+
+exp$obs = sapply(exp$sample, function(x) sum(meta$sample == x))
+exp$cells = as.numeric(gsub(",", "", exp$cells))
+
+ggplot(exp, aes(x = cells, y = obs, col = factor(sample))) +
+  geom_point() +
+  scale_colour_Publication(name = "Sample") +
+  scale_x_log10(breaks = c(500, 1000, 5000)) +
+  scale_y_log10(breaks = c(500, 1000, 5000)) +
+  labs(x = "Predicted number of cells", y = "Observed number of cells") +
+  geom_abline(slope = 1, intercept = 0)
+
+```
+
+# Save data
+
+The data is now saved to disk.
+
+```{r save-data}
+
+null_holder = writeMM(counts, file = "/nfs/research1/marioni/jonny/embryos/data/raw_counts.mtx")
+saveRDS(as(counts, "dgCMatrix"), file = "/nfs/research1/marioni/jonny/embryos/data/raw_counts.rds")
+write.table(barcodes, file = "/nfs/research1/marioni/jonny/embryos/data/barcodes.tsv", row.names = F, col.names = F, quote = F, sep = "\t")
+write.table(meta, file = "/nfs/research1/marioni/jonny/embryos/data/meta.tab", row.names = F, col.names = T, quote = F, sep = "\t")
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

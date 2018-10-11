@@ -1,0 +1,1 @@
+This folder contains scripts used to analyse the atlas dataset. Generally, the folders should be quite self explanatory. The `core_functions.R` script contains some useful wrapper functions for e.g. batch correction, HVG selection. Numbered sections lay the groundwork for the other scripts.

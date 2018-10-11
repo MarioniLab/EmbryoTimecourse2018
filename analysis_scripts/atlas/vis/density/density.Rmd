@@ -1,0 +1,108 @@
+---
+title: "Embryo atlas coverage - cell densities"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+How can we evaluate the completeness of our atlas? Here, we consider the density of cells in the gene expression space. This provides a relative assessment of how well-sampled the embryonic tissues are: in areas of high density, the transcriptomic landscape is well described; in areas of low density, we have not sampled as well from the true biological manifold. Note that this measure of sampling is not only detemined by the number of cells captured, but also the transcriptional heterogeneity of particular types of cell: sampling some cell types is *intrinsically* harder than others.
+
+To measure density, we have used the batch corrected PCA. Densities were determined using a tricube-weighted kernel centred on each cell. The radius of that kernel is the median of the distances of each cell to their fiftieth nearest neighbour. 
+
+```{r setup, message=FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+#set it up for scran to be properly parallelised
+library(BiocParallel)
+ncores = 1
+mcparam = MulticoreParam(workers = ncores)
+register(mcparam)
+library(irlba)
+library(cowplot)
+library(kmknn)
+library(viridis)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+```
+
+```{r compute,warning = FALSE}
+
+pcs = corrected$all
+
+pre.pcs <- precluster(pcs)
+self.dist <- findKNN(precomputed=pre.pcs, k=50, BPPARAM=mcparam, get.index=FALSE)$distance
+dist2nth <- median(self.dist[,ncol(self.dist)])
+dists <- findNeighbors(precomputed=pre.pcs, threshold=dist2nth, BPPARAM=mcparam, get.index=FALSE)$distance
+
+dens <- sapply(dists, function(x){
+  sum((1 - (x/dist2nth)^3)^3)
+})
+
+saveRDS(dens, file = "/nfs/research1/marioni/jonny/embryos/scripts/vis/density/density.rds")
+
+```
+
+Cell densities are shown on t-SNE in Figure \@ref(fig:tsnes).
+
+```{r tsnes, fig.wide = TRUE, fig.cap = "Cell densities shown on t-SNE"}
+
+dens=  readRDS("/nfs/research1/marioni/jonny/embryos/scripts/vis/density/density.rds")
+
+umap = read.table("/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.tab", header = FALSE, sep = "\t")
+
+
+p1 = ggplot(as.data.frame(umap), aes(x = V1, y = V2, col = log2(dens+1))) +
+  scale_color_viridis(name = "log\ndensity") +
+  geom_point(size = 0.4) +
+    theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+
+p2 = ggplot(as.data.frame(umap), aes(x = V1, y = V2, col = meta$celltype)) +
+  scale_color_manual(values = celltype_colours) +
+  geom_point(size = 0.4) +
+  theme(legend.position = "none",
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+
+plot_grid(p1, p2, rel_widths = c(0.55, 0.45))
+
+ggsave(p1, file = "/nfs/research1/marioni/jonny/embryos/scripts/vis/density/density_tsne.pdf", width = 7, height = 6)
+
+```
+
+Cell densities are shown split by cell type in Figure \@ref(fig:boxplot-celltype).
+
+```{r boxplot-celltype, fig.wide = TRUE, fig.cap = "Densities of different cell types."}
+
+p = ggplot(mapping = aes(x = factor(meta$celltype, levels = names(celltype_colours), ordered = TRUE), 
+                     y = log2(dens+1), 
+                     fill = factor(meta$celltype, levels = names(celltype_colours), ordered = TRUE))) +
+  geom_boxplot() +
+  scale_fill_manual(values = celltype_colours) +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1,
+                                   vjust = 0.5),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "log density")
+
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/embryos/scripts/vis/density/density_boxplot.pdf", width = 12, height = 5)
+
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

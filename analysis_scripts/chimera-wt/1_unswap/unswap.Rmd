@@ -1,0 +1,54 @@
+---
+title: "WT chimera: Swapped molecule removal"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+
+In this script, we exclude molecules that are likely to have derived from barcode swapping. In short, we identify molecules that share UMI, cell barcode, and aligned gene between samples that were sequenced together. These molecules are extremely unlikely to have arisen due to chance, and are instead far more likely to derive from barcode swapping. For more information on this phenomenon, please read [our paper](https://www.biorxiv.org/content/early/2018/04/06/177048). Figure \@ref(fig:plot-ratios) shows the fraction of molecules that were excluded, on a sample-by-sample basis. Note that we include two samples from an additional experiment in the unswapping procedure, but we only visualise the 6 samples that belong to this chimera dataset thereafter.
+
+```{r do-batch1, message = FALSE}
+
+library(DropletUtils)
+library(ggplot2)
+library(cowplot)
+library(Matrix)
+
+mol_loc = c(paste0("/nfs/research1/marioni/jonny/chimera-wt/cellranger_out/sample_", 1:6, "/outs/molecule_info.h5"),
+             paste0("/nfs/research1/marioni/jonny/chimera-t/cellranger_out/sample_", 1:2, "/outs/molecule_info.h5"))
+out_loc = c(paste0("/nfs/research1/marioni/jonny/chimera-wt/cellranger_out/sample_", 1:6, "/outs/raw_gene_bc_matrices/mm10_tomato/matrix_unswapped.mtx"),
+            paste0("/nfs/research1/marioni/jonny/chimera-t/cellranger_out/sample_", 1:2, "/outs/raw_gene_bc_matrices/mm10_tomato/matrix_unswapped.mtx"))
+bc_loc = c(paste0("/nfs/research1/marioni/jonny/chimera-wt/cellranger_out/sample_", 1:6, "/outs/raw_gene_bc_matrices/mm10_tomato/barcodes_unswapped.tsv"),
+           paste0("/nfs/research1/marioni/jonny/chimera-t/cellranger_out/sample_", 1:2, "/outs/raw_gene_bc_matrices/mm10_tomato/barcodes_unswapped.tsv"))
+gene_loc = c(paste0("/nfs/research1/marioni/jonny/chimera-wt/cellranger_out/sample_", 1:6, "/outs/raw_gene_bc_matrices/mm10_tomato/genes_unswapped.tsv"),
+             paste0("/nfs/research1/marioni/jonny/chimera-t/cellranger_out/sample_", 1:2, "/outs/raw_gene_bc_matrices/mm10_tomato/genes_unswapped.tsv"))
+
+
+unswapped = swappedDrops(mol_loc, get.swapped = TRUE)
+
+for(i in 1:length(mol_loc)){
+  null_holder = writeMM(unswapped$cleaned[[i]], file = out_loc[i])
+  write.table(colnames(unswapped$cleaned[[i]]), file = bc_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+  write.table(rownames(unswapped$cleaned[[i]]), file = gene_loc[i], col.names = FALSE, row.names = FALSE, quote = FALSE)
+}
+
+unswapped$swapped = unswapped$swapped[1:6]
+unswapped$cleaned = unswapped$cleaned[1:6]
+
+ratios = sapply(1:length(unswapped$cleaned), function(i){
+  sum(unswapped$swapped[[i]])/(sum(unswapped$cleaned[[i]]) + sum(unswapped$swapped[[i]]))
+})
+
+```
+
+```{r plot-ratios, fig.cap = "Fraction of molecules removed due to barcode-swapping correction."}
+
+ggplot(data.frame(ratios = ratios, sample = 1:6), aes(x = sample, y = ratios)) +
+  geom_bar(stat = "identity", fill = "grey20") +
+  labs(x = "Sample", y = "Fraction of molecules excluded")
+
+```

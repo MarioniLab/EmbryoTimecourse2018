@@ -1,0 +1,1 @@
+This folder contains scripts used to analyse the WT-chimera dataset. Generally, the folders should be quite self explanatory. The `core_functions.R` script contains some useful wrapper functions, but loads in more functions from the atlas version of the same script. Numbered sections lay the groundwork for the other scripts.

@@ -1,0 +1,51 @@
+---
+title: "U-map computation"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+This script calculates the UMAP for Figure 1. It is shown in Figure \@ref(fig:plot).
+
+```{r load}
+
+library(Matrix)
+library(scran)
+library(Rtsne)
+library(irlba)
+library(cowplot)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+```
+
+```{r process}
+
+write.table(corrected$all, file = "/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/scanpy_input.tab", col.names = FALSE, row.names = FALSE, sep = "\t", quote = FALSE)
+
+write.table(corrected$all[!meta$cluster %in% c(3, 8, 4, 11),], file = "/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/scanpy_input_embryonic.tab", col.names = FALSE, row.names = FALSE, sep = "\t", quote = FALSE)
+
+system("python3 /nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.py")
+
+umap = read.table("/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.tab", header = FALSE, sep = "\t")
+
+```
+
+```{r plot}
+
+p = ggplot(umap, aes(x= V1, y = V2, col = factor(meta$celltype, levels = names(celltype_colours), ordered = TRUE))) +
+  scale_color_manual(values = celltype_colours, name = "") +
+  geom_point(size = 0.2) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  guides(col = guide_legend(override.aes = list(size = 5)))
+
+p
+
+ggsave(p, file = "/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.pdf", width = 11, height = 5)
+
+```

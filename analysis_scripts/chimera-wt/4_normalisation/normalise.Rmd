@@ -1,0 +1,76 @@
+---
+title: "WT chimera: Normalisation"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: true
+    theme: united
+---
+
+In this script we calculate size factors for normalisation with scran.
+
+```{r load, message = FALSE}
+library(Matrix)
+library(scran)
+library(scater)
+library(igraph)
+library(BiocParallel)
+ncores = 16
+mcparam = SnowParam(workers = ncores)
+register(mcparam)
+
+source("/nfs/research1/marioni/jonny/chimera-wt/scripts/core_functions.R")
+load_data(normalise = FALSE)
+
+
+lib.sizes = Matrix::colSums(counts(sce))
+sce = sce[calcAverage(sce)>0.1,]
+
+```
+
+
+For pre-clustering, we use scran's `quickCluster` function, using the `igraph` method. We specify a maximum cluster size of 3000 cells and a minimum cluster size of 100 cells.
+
+
+```{r cluster}
+
+clusts = as.numeric(quickCluster(sce, method = "igraph", min.size = 100, BPPARAM = mcparam))
+
+```
+
+The calculated size factors are shown in Figure \@ref(fig:normalise).
+
+```{r normalise, fig.cap = "Size factors are proportional to UMI count, with no noteable outliers."}
+
+#now run the normalisation
+#number of cells in each cluster should be at least twice that of the largest 'sizes'
+min.clust = min(table(clusts))/2
+new_sizes = c(floor(min.clust/3), floor(min.clust/2), floor(min.clust))
+sce = computeSumFactors(sce, clusters = clusts, sizes = new_sizes, max.cluster.size = 3000)
+
+
+ggplot(data = data.frame(X = lib.sizes, Y = sizeFactors(sce)),
+              mapping = aes(x = X, y = Y)) +
+  geom_point() +
+  scale_x_log10(breaks = c(5000, 10000, 50000, 100000), labels = c("5,000", "10,000", "50,000", "100,000") ) +
+  scale_y_log10(breaks = c(0.2, 1, 5)) +
+  labs(x = "Number of UMIs", y = "Size Factor")
+
+
+#When we load data for scran we want raw counts + size factors, so now we save the size factors
+write.table(sizeFactors(sce), quote = F, col.names = F, row.names = F, file = "/nfs/research1/marioni/jonny/chimera-wt/data/sizefactors.tab")
+```
+
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

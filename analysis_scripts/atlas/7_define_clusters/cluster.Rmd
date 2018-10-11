@@ -1,0 +1,427 @@
+---
+title: "Defining Clusters"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: true
+    theme: united
+---
+
+# Introduction
+
+```{r load_data, message=FALSE}
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+
+library(Matrix)
+library(scran)
+#set it up for scran to be properly parallelised
+library(BiocParallel)
+ncores = 16
+mcparam = SnowParam(workers = ncores)
+register(mcparam)
+library(igraph)
+library(reshape2)
+library(ggplot2)
+library(knitr)
+library(scater)
+library(cowplot)
+library(scales)
+library(Rtsne)
+library(biomaRt)
+
+
+corrected = readRDS("/nfs/research1/marioni/jonny/embryos/data/corrected_pcas.rds")
+
+#define point attributes to make plots more readable
+tsne_size = 0.6
+tsne_alpha = 1
+```
+
+This script identifies the clusters that we use for further analysis.
+
+Because of the size of our dataset, we use a graphical method to identify clusters. This provides a considerable saving in memory usage and computation time compared to traditional distance matrix-based methods. Specifically, we follow the following procedure:
+
+1. Exclude doublet-called cells
+
+2. Construct a shared nearest neighbour (SNN) graph over the cells. For each pair of cells, this connects cells according to the number of each of their nearest neighbours that are shared. Cells that are a long way away therefore remain unconnected, while cells that are close to each other will be connected by edges of strength equal to the number of neighbours that are shared. We consider the nearest 10 neighbours of each cell in the space of the first 50 batch-corrected PCs.
+
+3. Identify communities in the graph using the Louvain algorithm.
+
+#All-cell clusters
+
+We now implement our method over all non-doublet cells. The sizes of clusters are shown in Figure \@ref(fig:build-graph)
+
+```{r build-graph, fig.cap = "Cluster sizes"}
+
+
+#now collapse them
+graph = buildSNNGraph(corrected$all, BPPARAM = mcparam, d = NA, transposed = TRUE)
+
+set.seed(42)
+clustered = cluster_louvain(graph)
+
+meta$cluster = as.vector(membership(clustered))
+clust.sizes = sapply(1:length(unique(meta$cluster)), function(x) sum(meta$cluster == x))
+
+ggplot(meta, aes(x = meta$cluster)) +
+  geom_bar() +
+  labs(x = "Cluster number", y = "Number of cells") +
+  scale_x_continuous(breaks = 1:length(clust.sizes))
+
+```
+
+We visualise the cells & clusters with t-SNE in Figure \@ref(fig:tsne-clusters).
+
+```{r tsne-clusters, fig.height=8, fig.wide=TRUE, fig.cap="Cells visualised by t-SNE. Cells are coloured by their cluster label"}
+
+set.seed(42)
+pca = corrected$all
+tsne = Rtsne(pca, check_duplicates = FALSE, pca = FALSE, perplexity = 120)
+
+plot_df = as.data.frame(tsne$Y)
+plot_df$cell = meta$cell
+plot_df$sample = meta$sample
+plot_df$stage = meta$stage
+plot_df$cluster = meta$cluster
+plot_df = plot_df[sample(nrow(plot_df), nrow(plot_df), replace = FALSE), ]
+
+ggplot(data = plot_df, mapping = aes(x = V1, y = V2, col = factor(cluster))) +
+  geom_point(size = tsne_size, alpha = tsne_alpha) +
+  labs(x = "t-sne 1", y = "t-sne 2") +
+  scale_colour_Publication(name = "Cluster") +
+  guides(colour = guide_legend(override.aes = list(size=6)))
+
+
+
+```
+
+Timepoint information is shown in Figure \@ref(fig:tsne-stage)
+
+```{r tsne-stage, fig.height=8, fig.wide=TRUE, fig.cap="Cells visualised by t-SNE. Cells are coloured by their developmental stage"}
+
+ggplot(data = plot_df, mapping = aes(x = V1, y = V2, col = factor(stage))) +
+  geom_point(size = tsne_size, alpha = tsne_alpha) +
+  labs(x = "t-sne 1", y = "t-sne 2") +
+  scale_colour_manual(values = stage_colours, labels = stage_labels, name = "Stage") +
+  ggtitle("Stage")  +
+  guides(colour = guide_legend(override.aes = list(size=6)))
+```
+
+In Figure \@ref(fig:panel-tsne), the clusters are shown on per-stage t-SNEs.
+
+```{r panel-tsne, fig.width=10, fig.height=12, fig.wide=TRUE, fig.cap="Cells visualisised by t-sne for each stage. Cells are coloured by their cluster, calculated over all stages.", message=FALSE}
+
+pcas = lapply(unique(meta$stage), function(x) {
+  corrected$stage[[x]]
+})
+
+tsnes = lapply(pcas, function(pc) {
+  require(Rtsne)
+  tsne = Rtsne(pc, pca = FALSE)$Y
+  return(tsne)
+})
+
+tsnes = lapply(1:length(tsnes), function(x) cbind(tsnes[[x]], unique(meta$stage)[x]))
+
+coords = as.data.frame(do.call(rbind,tsnes))
+names(coords) = c("tsne1", "tsne2", "stage")
+
+cellnames = lapply(unique(meta$stage), function(x) meta$cell[which(meta$stage == x)])
+coords$cell = do.call(c, cellnames)
+
+coords$cluster = meta$cluster[match(coords$cell, meta$cell)]
+coords$sample = meta$sample[match(coords$cell, meta$cell)]
+
+
+ggplot(data = coords, mapping = aes(x = as.numeric(as.character(tsne1)), y = as.numeric(as.character(tsne2)), col = factor(cluster))) +
+  geom_point() +
+  scale_colour_Publication() +
+  facet_wrap(~coords$stage, ncol = 3) +
+  theme(legend.position = "none") +
+  guides(colour = guide_legend(override.aes = list(size=6)))
+
+```
+
+##Clustering within clusters
+
+The top-level clusters that we have defined above do not capture all of the substructure that is present in the data (e.g. cell maturation over time within individual clusters). To provide a finer-grained clustering, we repeat out clustering again within each of the clusters that we have defined, with three changes (as the cells within a cluster are considerably more homogenous than the whole-embryo data that we started with). 
+
+Specifically, we increase the minimum mean expression level for a gene to be considered as highly variable to the 30% quantile of mean expression level of expressed genes. This prevents binomially expressed genes (where the loess fit is poor, due to discretisation of the data) from being considered for this analysis. 
+
+We also avoid use of the F-statistic inflection point for identifying a maximum gene expression threshold for HVGs. This is because clusters can contain very small contributions from individual samples, so inter-sample variances are unstable. Instead, we use the average threshold calculated across all cells at each timepoint, as described in the HVG script. 
+
+Finally, we enforce the selection of the top 1000 HVGs, such that there are neither too few nor too many to perform further clustering on.
+
+The clusters generated under this scheme are shown the first three numbered clusters in Figure \@ref(fig:in-clusters).
+
+```{r in-clusters, fig.wide = TRUE, fig.cap="Sub-clustering for the first three numbered clusters", message = FALSE, warning = FALSE}
+
+
+
+sub_clusters= lapply(1:length(unique(meta$cluster)), function(x){
+  #possibly this needs recalculation of HVGs
+  pc_sub = corrected$all[meta$cluster == x,]
+  
+  graph = buildSNNGraph(pc_sub, d = NA, BPPARAM = mcparam, transposed = TRUE)
+  set.seed(42)
+  clusts = cluster_louvain(graph)
+  return(as.numeric(membership(clusts)))
+})
+
+
+# SAVE TO META
+meta$cluster.sub = NA
+
+for( i in 1:length(unique(meta$cluster))){
+  meta$cluster.sub[meta$cluster == i] = sub_clusters[[i]]
+}
+
+plot_sub_cluster = function(sub_clusters, sub_meta){
+  if(length(unique(sub_meta$cluster))>1)
+    stop("Should be only one cluster in sub_meta")
+  
+  plot_df = as.data.frame(tsne$Y)
+  plot_df$cell = meta$cell
+  plot_df$cluster = meta$cluster
+  plot_df$col = 0
+  plot_df$col[match(sub_meta$cell, plot_df$cell)] = sub_clusters
+  
+  rand = sample(nrow(plot_df), nrow(plot_df))
+  plot_df = plot_df[rand,]
+  
+  plot_df = rbind(plot_df[plot_df$col == 0,],
+                  plot_df[plot_df$col != 0,])
+  
+  
+  p = ggplot(data = plot_df, mapping = aes(x = V1, y = V2, col = factor(col))) +
+  geom_point(size = 0.6, alpha = 1) +
+  labs(x = "t-sne 1", y = "t-sne 2") +
+  scale_colour_Publication() +
+  theme_cowplot() +
+    ggtitle(paste("Cluster", sub_meta$cluster[1])) +
+    theme(legend.position = "none")
+  return(p)
+}
+
+plots = lapply(1:3, function(x){
+  return(plot_sub_cluster(sub_clusters[[x]], meta[meta$cluster == x,]))
+})
+
+plot_grid(plotlist =plots, nrow=  1)
+
+```
+
+#Contributions across stages
+
+Individual clusters contain cells from different stages, as different cell populations mature at different times and at different rates. Figure \@ref(fig:stage-contrib) shows the contributions of different stages to each cluster
+
+
+```{r stage-contrib, fig.wide=TRUE, fig.cap="Contributions of different stages to clusters. Clusters are ordered from youngest mean stage to oldest. The mixed timepoints are excluded from this plot."}
+
+stage_colours = c(brewer_pal(palette = "Spectral")(length(unique(meta$stage))-1), "darkgrey")
+names(stage_colours) = unique(meta$stage)[order(unique(meta$stage))]
+stage_labs = c(names(stage_colours)[-length(stage_colours)], "Mixed")
+names(stage_labs) = names(stage_colours)
+
+known_meta = meta[meta$stage!="mixed_gastrulation",]
+
+contrib_known = table(known_meta$cluster, known_meta$stage)/rowSums(table(known_meta$cluster, known_meta$stage))
+mean_stage = apply(contrib_known, 1, function(x) sum(x * seq(6.5, 8.5, 0.25)))
+
+# contrib_known = table(meta$cluster, meta$stage)/rowSums(table(meta$cluster, meta$stage))
+pdf = melt(contrib_known)
+names(pdf) = c("cluster", "stage", "fraction")
+
+
+ggplot(pdf, aes(x = factor(cluster, ordered = TRUE, levels = names(mean_stage)[order(mean_stage)]), y= fraction, fill = stage)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = stage_colours, labels = stage_labs, name = "") +
+  labs(x = "Cluster", y= "Cell fraction")
+
+```
+
+#Stage-wise clustering
+
+Where a researcher is particularly interested in cells derived from embryos of a particular developmental stage, an appropriate clustering is one that only takes into account cells at that stage.
+
+We therefore repeat the same method as clustering method as described above, but separately at each timepoint, to designate stage-level clusters. HVGs were calculated separately in each timepoint as was performed for the all-cell subset. Similarly, we define clusters at each of the Theiler stages. Clustering results are not shown, but may be seen on the accompanying website for this paper.
+
+```{r cluster-stage}
+
+meta$cluster.stage = NA
+
+stage_clusters = lapply(unique(meta$stage), function(x){
+  graph = buildSNNGraph(corrected$stage[[x]], BPPARAM = mcparam, d = NA, transposed = TRUE)
+  set.seed(42)
+  out = cluster_louvain(graph)
+  return(as.numeric(membership(out)))
+})
+
+names(stage_clusters) = unique(meta$stage)
+
+
+
+for(stage in names(stage_clusters)){
+    meta$cluster.stage[meta$stage == stage] = stage_clusters[[stage]]
+}
+
+
+
+```
+
+
+```{r cluster-theiler}
+
+meta$cluster.theiler = NA
+
+thei_clusters = lapply(unique(meta$theiler), function(x){
+  graph = buildSNNGraph(corrected$theiler[[x]], d = NA, transposed = TRUE, BPPARAM = mcparam)
+  set.seed(42)
+  out = cluster_louvain(graph)
+  return(as.numeric(membership(out)))
+})
+
+names(thei_clusters) = unique(meta$theiler)
+
+for(x in names(thei_clusters)){
+  meta$cluster.theiler[meta$theiler == x] = thei_clusters[[x]]
+}
+
+```
+
+
+#Confounding factors
+
+It is feasible that clusters could be generated due to technical differences between cells. In this section, we examine some of these technical drivers.
+
+##Cell library size
+
+Cell library sizes (i.e. number of UMIs) per cluster are shown in Figure \@ref(fig:check-clust-cellsize). Several clusters show reduced library sizes.
+
+```{r check-clust-cellsize, fig.wide=TRUE, fig.cap = "Cell size distributions per cluster."}
+
+libsizes = Matrix::colSums(counts(sce))
+
+ggplot(data = data.frame(lib = libsizes, clust = meta$cluster), mapping = aes(x = factor(clust), y = lib)) +
+  geom_boxplot() +
+  # annotate("text",
+  #      x = 1:length(unique(meta$cluster)),
+  #      y = rep_len(c(4000, 3000), 
+  #                  length.out = length(unique(meta$cluster))),
+  #      label = clust.sizes,
+  #      col = rep(c("black", "black", "grey30", "grey30"),
+  #                length(unique(meta$cluster)))[1:length(unique(meta$cluster))]) +
+  scale_y_log10() +
+  labs(x = "Cluster", y = "#UMIs")
+
+
+```
+
+## Mitchondrial gene fraction
+
+We have used mitochondrial gene expression as a QC metric earlier in our analysis pipeline. In Figure \@ref(fig:check-clust-mt), the mitochondrial gene expression fraction is shown for cells in different clusters. There is no considerable deviation between our clusters.
+
+```{r check-clust-mt, fig.wide=TRUE, warning=FALSE, fig.cap = "Mitochondrial expression distributions per cluster."}
+
+mouse_ensembl = useMart("ensembl")
+mouse_ensembl = useDataset("mmusculus_gene_ensembl", mart = mouse_ensembl)
+
+gene_map = getBM(attributes=c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = genes[,1], mart = mouse_ensembl)
+
+mt.counts = counts(sce)[which(genes[,1] %in% gene_map$ensembl_gene_id[gene_map$chromosome_name=="MT"]), ]
+mt.fraction = Matrix::colSums(mt.counts)/Matrix::colSums(counts(sce))
+
+ggplot(data = data.frame(mt = mt.fraction, clust = meta$cluster), mapping = aes(x = factor(clust), y = mt.fraction)) +
+  geom_boxplot() +
+  # annotate("text",
+  #      x = 1:length(unique(meta$cluster)),
+  #      y = rep_len(c(max(mt.fraction), max(mt.fraction)*1.05), 
+  #                  length.out = length(unique(meta$cluster))),
+  #      label = clust.sizes) +
+  labs(x = "Cluster", y = "Mitochondrial UMI fraction")
+
+```
+
+## Ribosomal genes
+
+Like mitochondrial genes, ribosomal genes may also produce technically-derived clustering bias. Expression levels of *Rps\** and *Rpl\** genes are shown in Figure \@ref(fig:rb-genes). There is no substantial deviation between clusters.
+
+```{r rb-genes, fig.wide = TRUE, fig.cap = "Ribosomal gene expression distributions per cluster."}
+
+rb.counts = counts(sce)[grepl("Rpl", genes[,2], ignore.case = FALSE) |
+                              grepl("Rps", genes[,2], ignore.case = FALSE), ]
+rb.fraction = Matrix::colSums(rb.counts)/Matrix::colSums(counts(sce))
+
+suppressWarnings(ggplot(data = data.frame(rb = rb.fraction, clust = meta$cluster), mapping = aes(x = factor(clust), y = rb)) +
+  geom_boxplot() +
+  labs(x = "Cluster", y= "Ribosomal UMI fraction"))
+
+
+```
+
+##Sex
+
+We excluded sex genes (*Xist* and Y-chromosome) from our highly-variable gene sets. We show that our clusters are not affected in grounds of sex in Figures \@ref(fig:sex-y) and \@ref(fig:sex-xist) by considering the expression of these genes.
+
+```{r sex-y, fig.wide=TRUE, warning=FALSE, fig.cap = "Y-chromosome gene expression across clusters"}
+
+y.counts = counts(sce)[which(genes[,1] %in% gene_map$ensembl_gene_id[gene_map$chromosome_name=="Y"]),]
+y.fraction = Matrix::colSums(y.counts)/Matrix::colSums(counts(sce))
+
+ggplot(data = data.frame(yfrac = y.fraction, clust = meta$cluster), mapping = aes(x = factor(clust), y = yfrac)) +
+  geom_boxplot() +
+  labs(y = "Y chromosome gene fraction", x = "Cluster")
+
+```
+
+```{r sex-xist, fig.wide = TRUE, fig.cap = "Xist expression across clusters", warning = FALSE}
+
+expr = logcounts(sce)[which(genes[,2] == "Xist"),]
+
+ggplot(data = data.frame(y = expr, clust = meta$cluster), mapping = aes(x = factor(clust), y = expr)) +
+  geom_boxplot() +
+  labs(y = "Xist log-counts", x = "Cluster")
+
+```
+
+#Save the metadata
+
+Now we save the results from the previous sections of this analysis.
+
+```{r save_meta}
+
+#reconstruct big metadata
+big_meta = read.table("/nfs/research1/marioni/jonny/embryos/data/meta.tab", sep = "\t", header = TRUE)
+
+insert_na = function(variable, small_meta = meta, orig_meta = big_meta){
+  out = rep(NA, nrow(orig_meta))
+  out[match(small_meta$cell, orig_meta$cell)] = variable
+  return(out)
+}
+
+big_meta$cluster = insert_na(meta$cluster)
+big_meta$cluster.sub = insert_na(meta$cluster.sub)
+big_meta$cluster.stage = insert_na(meta$cluster.stage)
+big_meta$cluster.theiler = insert_na(meta$cluster.theiler)
+
+
+write.table(big_meta, file = "/nfs/research1/marioni/jonny/embryos/data/meta.tab", sep = "\t", row.names = F, col.names = T, quote = F)
+
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

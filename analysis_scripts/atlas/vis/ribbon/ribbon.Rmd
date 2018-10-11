@@ -1,0 +1,300 @@
+---
+title: "Cell-prevalence ribbon plots"
+author: "Jonathan Griffiths"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+
+```{r load}
+library(ggplot2)
+library(cowplot)
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+meta = read.table("/nfs/research1/marioni/jonny/embryos/data/meta.tab", header = TRUE, stringsAsFactors = FALSE, comment.char = "$", sep = "\t")
+meta = meta[!(meta$doublet | meta$stripped),]
+meta = meta[grepl("E", meta$stage),]
+meta = meta[order(meta$stage),]
+meta$timepoint = meta$stage
+
+
+#Each of these is a vector, with each entry corresponding to a single cell.
+#I.e. row one of clusters and timepoints corresponds to the SAME cell.
+#I.e., use metadata columns!
+#timepoints are x-axis, ordered as you want them to appear
+#clusters are y-axis shading 
+#colours should be a named vector of colours, names are the clusters specified.
+#the order of colours specifies the order in the plot
+plot_fn = function(timepoints, clusters, colours = celltype_colours, plateau = FALSE, embryo_doubling = FALSE){
+  
+  df = data.frame(cluster = rep(unique(clusters), length(unique(timepoints))),
+                  stage = do.call(c, lapply(as.character(unique(timepoints)), rep, times = length(unique(clusters)))))
+  
+  
+  
+  df$ranking = match(df$cluster, names(colours))
+  df= df[order(df$stage, df$ranking),]
+
+  df$frac = sapply(seq_len(nrow(df)), function(x){
+    return(sum(clusters == df$cluster[x] & timepoints == df$stage[x])/sum(timepoints == df$stage[x]))
+  })
+  
+  df$cumfrac = NA
+  for(x in 1:nrow(df)){
+    df$cumfrac[x] = sum(df$frac[df$stage == df$stage[x] & df$ranking < df$ranking[x]])
+  }
+  
+  # #manually get TS/stage ordering
+  # if(grepl("TS", df$stage[1])){
+  #   stage_order = paste0("TS", 9:12)
+  #   df$xpos = match(df$stage, paste0("TS", 9:12))
+  # } else {
+  #   stage_order = unique(df$stage)[order(unique(df$stage))]
+  #   df$xpos = match(df$stage, stage_order)
+  # }
+  
+  df$xpos = match(df$stage, unique(timepoints))
+
+  if(plateau){
+    df1 = df
+    df2 = df
+    df1$xpos = df1$xpos - 0.2
+    df2$xpos = df2$xpos + 0.2
+    df = rbind(df1, df2)
+  }
+  
+  if(embryo_doubling){
+    stages = 800*2^(1/5 * seq(from = 0, by = 6, length.out = 5))
+    stages = c(stages,
+               stages[length(stages)] * 2^(1/10 * seq(from = 6, by = 6, length.out = 4)))
+    names(stages) = unique(timepoints)[order(unique(timepoints))]
+    stages = stages[1:length(unique(timepoints))]
+    
+    for(stage in unique(names(stages))){
+      df$cumfrac[df$stage == stage] = df$cumfrac[df$stage == stage] * stages[stage]
+      df$frac[df$stage == stage] = df$frac[df$stage == stage] * stages[stage]
+    }
+    
+  }
+  
+  
+  p = ggplot(df, aes(x = xpos, 
+                       # x = factor(stage, levels = unique(stage)[order(unique(stage))]), 
+                       ymin = cumfrac, 
+                       ymax = cumfrac + frac, 
+                       fill = factor(cluster, levels = names(colours)), 
+                       col = factor(cluster, levels = names(colours)))) +
+    geom_ribbon() +
+    scale_fill_manual(values = colours, drop = FALSE, name = "") +
+    scale_color_manual(values = colours, drop = FALSE, name = "") +
+    scale_x_continuous(breaks = seq_along(unique(timepoints)), labels = unique(timepoints), name = "")
+  
+  if(embryo_doubling)
+    p = p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  
+  return(p)
+  
+}
+
+
+
+
+```
+
+#Theiler stage plots
+
+##simple
+
+```{r, fig.wide = TRUE}
+
+
+
+theiler_plot = plot_fn(timepoints = meta$theiler, clusters = meta$celltype)
+plot(theiler_plot)
+
+ggsave(theiler_plot + guides(fill=guide_legend(ncol=1)), 
+       filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/theiler.pdf", 
+       width = 8, height = 6)
+
+```
+
+## Including flat parts
+
+```{r, fig.wide=TRUE}
+
+theiler_plateau = plot_fn(timepoints = meta$theiler, clusters = meta$celltype, plateau = TRUE)
+plot(theiler_plateau +guides(fill=guide_legend(ncol=1)))
+
+ggsave(theiler_plateau + guides(fill=guide_legend(ncol=1)), 
+       filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/theiler_plateau.pdf", 
+       width = 8, height = 6)
+
+```
+
+
+# Timepoint plots
+
+
+```{r timepoints, fig.wide = TRUE}
+
+stage_plot = plot_fn(meta$timepoint, 
+                     meta$celltype)
+plot(stage_plot)
+
+ggsave(stage_plot + guides(fill=guide_legend(ncol=1)), 
+       filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/stage.pdf", 
+       width = 8, height = 6)
+
+```
+
+
+
+```{r, fig.wide = TRUE, fig.height = 10}
+
+stage_doub_plot = plot_fn(meta$timepoint, 
+                         meta$celltype,
+                         embryo_doubling = TRUE) +
+  guides(fill=guide_legend(ncol=1))
+
+plot(stage_doub_plot)
+
+```
+
+```{r, fig.wide = TRUE}
+
+keep = meta$timepoint %in% paste0("E", c("6.5", "6.75", "7.0", "7.25", "7.5"))
+stage_doub_plot_early = plot_fn(meta$timepoint[keep], 
+                         meta$celltype[keep],
+                         embryo_doubling = TRUE) +
+  guides(fill=guide_legend(ncol=1))
+
+plot(stage_doub_plot_early)
+
+
+```
+
+```{r, fig.wide = TRUE, fig.height = 10}
+
+tot = ggdraw() +
+  draw_plot(stage_doub_plot, 0, 0, 1, 1) +
+  draw_plot(stage_doub_plot_early + 
+              theme(legend.position = "none"), x = 0.05,  y=0.35, width =0.4, height=0.6)
+
+plot(tot)
+
+ggsave(tot,
+       filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/stage_doubling.pdf", 
+       width = 11, height = 6)
+
+```
+
+<!-- #Cell type plots -->
+
+<!-- ```{r} -->
+
+<!-- celltype_stage = plot_fn(clusters = annot_meta$celltype, timepoints = annot_meta$timepoint, colours = celltype_colours) -->
+
+<!-- ggsave(celltype_stage + guides(fill=guide_legend(ncol=2)),  -->
+<!--        filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/stage_celltype.pdf",  -->
+<!--        width = 11, height = 6) -->
+
+<!-- celltype_theiler = plot_fn(clusters = annot_meta$celltype, timepoints = annot_meta$theiler, colours = celltype_colours) -->
+
+<!-- ggsave(celltype_theiler + guides(fill=guide_legend(ncol=2)),  -->
+<!--        filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/theiler_celltype.pdf",  -->
+<!--        width = 11, height = 6) -->
+
+<!-- celltype_plateau = plot_fn(clusters = annot_meta$celltype, timepoints = annot_meta$theiler, colours = celltype_colours, plateau = TRUE) -->
+
+<!-- ggsave(celltype_plateau + guides(fill=guide_legend(ncol=2)),  -->
+<!--        filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/plateau_celltype.pdf",  -->
+<!--        width = 11, height = 6) -->
+
+<!-- ``` -->
+
+<!-- # ```{r} -->
+<!-- #  -->
+<!-- # celltype_doub = plot_fn(clusters = annot_meta$celltype,  -->
+<!-- #                         timepoints = annot_meta$timepoint,  -->
+<!-- #                         colours = celltype_colours, -->
+<!-- #                         embryo_doubling = TRUE) -->
+<!-- #  -->
+<!-- # keep = annot_meta$timepoint %in% paste0("E", c("6.5", "6.75", "7.0", "7.25", "7.5")) -->
+<!-- # celltype_doub_plot_early = plot_fn(annot_meta$timepoint[keep],  -->
+<!-- #                          annot_meta$celltype[keep], -->
+<!-- #                          colours = celltype_colours, -->
+<!-- #                          embryo_doubling = TRUE) + -->
+<!-- #   guides(fill=guide_legend(ncol=2)) -->
+<!-- #  -->
+<!-- #  -->
+<!-- #  -->
+<!-- #  -->
+<!-- # tot = ggdraw() + -->
+<!-- #   draw_plot(celltype_doub, 0, 0, 1, 1) + -->
+<!-- #   draw_plot(celltype_doub_plot_early +  -->
+<!-- #               theme(legend.position = "none"), x = 0.05,  y=0.35, width =0.3, height=0.6) -->
+<!-- #  -->
+<!-- # plot(tot) -->
+<!-- #  -->
+<!-- # save_plot(tot, filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/celltype_doub_inset.pdf", -->
+<!-- #           base_width = 11, base_height = 6) -->
+<!-- #  -->
+<!-- # save_plot(celltype_doub_plot_early, filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/celltype_doub_start.pdf", -->
+<!-- #           base_width = 11, base_height = 6) -->
+<!-- #  -->
+<!-- # save_plot(celltype_doub, filename = "/nfs/research1/marioni/jonny/embryos/scripts/vis/ribbon/plots/celltype_doub_end.pdf", -->
+<!-- #           base_width = 11, base_height = 6) -->
+<!-- #  -->
+<!-- # ``` -->
+
+<!-- ## Doubling height every stage -->
+
+<!-- Cell doubling rate ~5h -->
+
+<!-- ```{r, fig.wide=TRUE} -->
+
+<!-- stage_df_double = stage_df -->
+<!-- stage_vec = 2^(0:(length(unique(meta$timepoint))-1)) -->
+<!-- names(stage_vec) = unique(meta$timepoint)[order(unique(meta$timepoint))] -->
+<!-- for(stage in unique(stage_df_double)){ -->
+<!--   stage_df_double$cumfrac[stage_df_double$timepoint == stage] = stage_df_double$cumfrac[stage_df_double$timepoint == stage] * stage_vec[stage] -->
+<!--   stage_df_double$frac[stage_df_double$timepoint == stage] = stage_df_double$frac[stage_df_double$timepoint == stage] * stage_vec[stage] -->
+<!-- } -->
+
+<!-- ggplot(stage_df_double, aes(x = xpos,  -->
+<!--                      # x = factor(stage, levels = unique(stage)[order(unique(stage))]),  -->
+<!--                      ymin = cumfrac,  -->
+<!--                      ymax = cumfrac + frac,  -->
+<!--                      fill = factor(cluster),  -->
+<!--                      col = factor(cluster))) + -->
+<!--   geom_ribbon() + -->
+<!--   scale_colour_Publication() + -->
+<!--   scale_fill_Publication() + -->
+<!--   theme_cowplot() + -->
+<!--   theme(legend.position = "none") + -->
+<!--   scale_x_continuous(name = "Stage", breaks = 1:9, labels = unique(meta$timepoint)[order(unique(meta$timepoint))]) + -->
+<!--   scale_y_continuous(name = "Cell proportion") -->
+<!-- ``` -->
+
+<!-- ###Zoomed in at start -->
+
+<!-- ```{r, fig.wide=TRUE} -->
+
+<!-- ggplot(stage_df_double, aes(x = xpos,  -->
+<!--                      # x = factor(stage, levels = unique(stage)[order(unique(stage))]),  -->
+<!--                      ymin = cumfrac,  -->
+<!--                      ymax = cumfrac + frac,  -->
+<!--                      fill = factor(cluster),  -->
+<!--                      col = factor(cluster))) + -->
+<!--   geom_ribbon() + -->
+<!--   scale_colour_Publication() + -->
+<!--   scale_fill_Publication() + -->
+<!--   theme_cowplot() + -->
+<!--   theme(legend.position = "none") + -->
+<!--   scale_x_continuous(name = "Stage", breaks = 1:9, labels = unique(meta$timepoint)[order(unique(meta$timepoint))]) + -->
+<!--   scale_y_continuous(name = "Cell proportion") + -->
+<!--   coord_cartesian(xlim = c(1,5), ylim = c(0,20)) -->
+
+<!-- ``` -->
+

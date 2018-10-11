@@ -1,0 +1,2047 @@
+---
+title: "Endoderm coalescence"
+author: "Jonathan Griffiths"
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+    titlecaps: true
+---
+
+```{r functions}
+
+plot_expr = function(coord_1 = dmap$DC1, coord_2 = dmap$DC3, gene_name, labels = c("DC1", "DC3"), sce = sub_sce){
+  plot_df = data.frame(X = coord_1, Y = coord_2, expr = as.numeric(logcounts(sce[match(gene_name, genes[,2]),])))
+  plot_df = plot_df[order(plot_df$expr, decreasing = FALSE),]
+  
+   p = ggplot(plot_df, aes(x = X, y=Y, col = expr)) +
+    geom_point() +
+    scale_color_gradient2(name = paste0(gene_name, "\nlog2\ncounts"), mid = "cornflowerblue", low = "gray75", high = "black", midpoint = max(plot_df$expr)/2) +
+     labs(x = labels[1], y= labels[2])
+   
+   return(p)
+
+}
+
+```
+
+
+```{r load, message = FALSE, warning = FALSE}
+library(Matrix)
+library(scran)
+library(Rtsne)
+library(irlba)
+library(igraph)
+library(reshape2)
+library(scales)
+library(ggrepel)
+library(destiny)
+library(viridis)
+library(scater)
+library(matrixStats)
+# library(velocyto.R)
+library(FateID)
+library(knitr)
+library(RColorBrewer)
+library(pheatmap)
+library(biomaRt)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE, load_corrected = TRUE)
+
+#set it up for scran to be properly parallelised
+library(BiocParallel)
+ncores = 1
+mcparam = SnowParam(workers = ncores)
+register(mcparam)
+
+no_ticks = theme(axis.ticks = element_blank(), axis.text = element_blank())
+no_title = no_ticks + theme(axis.title = element_blank())
+
+```
+
+#Motivation
+
+In this script we will perform some analysis on a single germ layer of the embryo: the endoderm. Endodermal cells are highlighted in the manuscript Figure 1 UMAP in Figure \@ref(fig:present) in this document. A notable feature is the contiguous nature of the extraembryonic (ExE) Visceral endoderm and the embryonic Definitive endoderm, via the "Gut" annotated cells.
+
+```{r present, fig.cap = "Endoderm clusters are highlighted on the Figure 1 t-SNE", fig.wide = TRUE}
+
+umap = read.table("/nfs/research1/marioni/jonny/embryos/scripts/vis/umap/umap.tab", header = FALSE, sep = "\t")
+
+new_cols = as.character(meta$celltype)
+new_cols[!new_cols %in% c("Anterior Primitive Streak", "Def. endoderm", "Gut", "Visceral endoderm", "ExE endoderm")] = "Other"
+
+umap_global = ggplot(umap, aes(x= V1, y = V2, col = factor(new_cols, levels = c(names(celltype_colours), "Other"), ordered = TRUE))) +
+  scale_color_manual(values = c(celltype_colours, "Other" = "darkgrey"), name = "") +
+  geom_point(size = 0.2) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  guides(col = guide_legend(override.aes = list(size = 5)))
+
+umap_global
+
+
+
+```
+
+
+Work from the Hadjantonakis lab ( [Kwon et al.](https://www.ncbi.nlm.nih.gov/pubmed/18854136) ) showed that visceral endoderm cells do contribute to the embryonic gut - combined with the UMAP shown above, this suggests that we can molecularly dissect this apparently convergent process of endoderm formation.
+
+# Cell selection
+
+##Selection of appropriate cells
+
+We now select the appropriate cell types for our analysis, as highlighted above. There is one exception, however: the exclusion of two subclusters of definitive endoderm cells that shows notochordal properties. This cluster and its expression of the *Noto* gene is shown in Figure \@ref(fig:noto).
+
+```{r noto, fig.wide = TRUE, fig.height= 10, fig.cap = "Expression of Noto gene shown on UMAP and with respect to the excluded DE cells."}
+
+expr = as.numeric(logcounts(sce[match("Noto", genes[,2]),]))
+order = order(expr)
+
+p1 = ggplot(umap[order,], aes(x= V1, y = V2, col = expr[order])) +
+  scale_color_gradient2(name = "Noto\nlog2\ncounts", mid = "cornflowerblue", low = "gray75", high = "black", midpoint = max(expr)/2) +
+  geom_point(size = 0.2) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank())
+
+sub_meta = meta[meta$cluster == 9 & meta$cluster.sub %in% c(1:3), ]
+label = sapply(sub_meta$cluster.sub, switch,
+               "1" = "Notochord",
+               "2" = "Retained DE",
+               "3" = "Excluded DE")
+
+
+p2 = ggplot(mapping = aes(x = factor(label), y = expr[match(sub_meta$cell, meta$cell)], fill = label)) +
+  geom_boxplot() +
+  labs(y = "Noto log2 counts") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  scale_fill_manual(values = c("Notochord" = celltype_colours["Notochord"],
+                               "Retained DE" = celltype_colours["Def. endoderm"],
+                               "Excluded DE" = "cornflowerblue"))
+
+p = plot_grid(p1, p2, ncol = 1, rel_heights = c(0.6, 0.4))
+
+p
+
+```
+
+```{r subset, fig.height=8}
+
+
+keep = meta$cluster == 11 | ( meta$cluster == 9 & !meta$cluster.sub %in% c(1,3) )
+
+sub_sce = normalize(sce[, keep])
+sub_meta = meta[keep, ]
+sub_corrected = corrected$all[keep,]
+write.table(sub_corrected, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/test.tab", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+save(sub_sce, sub_meta, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/beginning_data.RData")
+
+# load("/nfs/research1/marioni/jonny/embryos/scripts/endoderm/beginning_data.RData")
+
+
+```
+
+This leaves us with the cells highlighted in the umap in Figure \@ref(fig:present-v2).
+
+
+```{r present-v2, fig.cap = "Endoderm clusters are highlighted on the Figure 1 t-SNE", fig.wide = TRUE}
+
+# new_cols = as.character(meta$celltype)
+# new_cols[!new_cols %in% c("Anterior Primitive Streak", "Def. endoderm", "Gut", "Visceral endoderm", "ExE endoderm")] = "Other"
+new_cols[meta$cluster == 9 & meta$cluster.sub %in%c(1,3)] = "Other"
+
+umap_global = ggplot(umap, aes(x= V1, y = V2, col = factor(new_cols, levels = c(names(celltype_colours), "Other"), ordered = TRUE))) +
+  scale_color_manual(values = c(celltype_colours, "Other" = "darkgrey"), name = "") +
+  geom_point(size = 0.2) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  guides(col = guide_legend(override.aes = list(size = 5)))
+
+umap_global
+
+ggsave(umap_global,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/umap_global.pdf",
+       width = 9, height = 6)
+
+```
+
+
+# Data visualisation
+
+We now visualise these cells in a number of different ways. We first perform a batch correction procedure using only these subsetted cells. This batch correction is identical to that considered for our global visualisation for Figure 1 of the manuscript. We use these batch correction coordinates for the following plots.
+
+```{r correct, warning = FALSE}
+
+hvgs = getHVGs(sub_sce)
+
+#get order: oldest to youngest; most cells to least cells
+order_df = sub_meta[!duplicated(sub_meta$sample), c("stage", "sample")]
+order_df$ncells = sapply(order_df$sample, function(x) sum(sub_meta$sample == x))
+order_df$stage = factor(order_df$stage, 
+                        levels = rev(c("E8.5", 
+                                   "E8.25", 
+                                   "E8.0", 
+                                   "E7.75", 
+                                   "E7.5", 
+                                   "E7.25", 
+                                   "mixed_gastrulation", 
+                                   "E7.0", 
+                                   "E6.75", 
+                                   "E6.5")))
+order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+order_df$stage = as.character(order_df$stage)
+
+set.seed(42)
+corrected = doBatchCorrect(counts = logcounts(sub_sce)[rownames(sub_sce) %in% hvgs,], 
+                             timepoints = sub_meta$stage, 
+                             samples = sub_meta$sample, 
+                             timepoint_order = order_df$stage, 
+                             sample_order = order_df$sample, 
+                             npc = 50)
+
+```
+
+##t-SNE
+
+The cells are visualised by t-SNE in Figure \@ref(fig:tsne) coloured by stage, and \@ref(fig:tsne-cluster) coloured by celltype
+
+```{r tsne, fig.cap = "Cell and their collection timepoints visualised by t-SNE. The first fifty principal components were selected for this visualisation."}
+set.seed(42)
+tsne = Rtsne(corrected, pca = FALSE, perplexity = 60)$Y
+
+no = sample(nrow(corrected), nrow(corrected))
+ggplot(mapping = aes(x = tsne[no, 1], y= tsne[no, 2], col = sub_meta$stage[no])) +
+  geom_point() +
+  scale_color_manual(values = stage_colours, name=  "Stage", labels = stage_labels) +
+  theme(panel.background = element_rect(fill = "grey80")) +
+  labs(x = "tSNE1", y=  "tSNE2")
+
+```
+
+```{r tsne-cluster, fig.cap = "Cells and their annotated celltype visualised by t-SNE. The first fifty principal components were selected for this visualisation."}
+
+ggplot(mapping = aes(x = tsne[no, 1], y= tsne[no, 2], col = factor(sub_meta$celltype[no]))) +
+  geom_point() +
+  scale_color_manual(values = celltype_colours, name=  "Celltype") +
+  labs(x = "tSNE1", y=  "tSNE2")
+
+```
+
+## UMAP
+
+The cells and their celltypes are visualised in Figure \@ref(fig:umap).
+
+```{r umap, fig.cap = "Cells projected via UMAP, labelled by celltype."}
+
+write.table(corrected, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/corrected.tab", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+shell = "/nfs/research1/marioni/jonny/embryos/embryos2017.simg"
+script = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/umap.py"
+
+#this was run separately
+# system(paste("singularity exec", shell, "python3", script))
+
+umap_endo = read.table("/nfs/research1/marioni/jonny/embryos/scripts/endoderm/umap.tab")
+
+ggplot(mapping = aes(x = umap_endo[no, 1], y= umap_endo[no, 2], col = sub_meta$celltype[no])) +
+  geom_point() +
+  scale_color_manual(values = celltype_colours, name=  "Celltype") +
+  labs(x = "UMAP1", y=  "UMAP2")
+
+```
+
+##PCA 
+
+The cells' transcriptomes are visualised using the batch-corrected PCA in Figure \@ref(fig:plot-pca)). We can see that PC1 separates cells based on their origin tissue (i.e. embryonic/extraembryonic) while PC2 separates by stage.
+
+```{r plot-pca, fig.wide = FALSE, fig.height = 8, fig.cap = "PCA of considered cells. PC2 separates cells according to their developmental stage. PC1 separates Visceral and Definitive endoderm, as shown by expression of Ttr, Apoe, and Bmp7."}
+
+
+
+p1 = ggplot(mapping = aes(x = corrected[no, 1], y= corrected[no, 2], col = sub_meta$stage[no])) +
+  geom_point() +
+  scale_color_manual(values = stage_colours, name=  "Stage", labels = stage_labels) +
+  theme(panel.background = element_rect(fill = "grey80")) +
+  labs(x = "Corrected PC1", y=  "Corrected PC2")
+
+p2 = ggplot(mapping = aes(x = corrected[no, 1], y= corrected[no, 2], col = sub_meta$celltype[no])) +
+  geom_point() +
+  scale_color_manual(values = celltype_colours, name= "Celltype") +
+  labs(x = "Corrected PC1", y=  "Corrected PC2")
+
+plot_grid(p1, p2, ncol = 1)
+
+```
+
+##Diffusion maps
+
+Finally, we have visualised the cells using Diffusion Maps in Figure \@ref(fig:dmaps), which was itself calculated from the batch-corrected PCA above.
+
+```{r dmaps, fig.wide = TRUE, fig.height=6, fig.cap = "Diffusion map embeddings of the data are shown."}
+
+
+dmap = DiffusionMap(corrected)
+
+dmap_stage = ggplot(mapping = aes(x = dmap$DC1[no], y= dmap$DC2[no], col = sub_meta$stage[no])) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = stage_colours, name = "Stage", stage_labels) +
+  labs(x = "DC1", y = "DC2")
+
+dmap_celltype = ggplot(mapping = aes(x = dmap$DC1[no], y= dmap$DC2[no], col = sub_meta$celltype[no])) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = celltype_colours, name = "Celltype") +
+  labs(x = "DC1", y = "DC2") +
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+
+dmap_celltype_2 = ggplot(mapping = aes(x = dmap$DC1[no], y= dmap$DC3[no], col = sub_meta$celltype[no])) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = celltype_colours, name = "Celltype") +
+  labs(x = "DC1", y = "DC3")
+
+dmap_stage_2 = ggplot(mapping = aes(x = dmap$DC1[no], y= dmap$DC3[no], col = sub_meta$stage[no])) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = stage_colours, name = "Stage", stage_labels) +
+  labs(x = "DC1", y = "DC3") +
+  guides(colour = guide_legend(override.aes = list(size = 5)))
+
+plot_grid(dmap_stage, dmap_celltype, dmap_stage_2, dmap_celltype_2, ncol =2, rel_widths = c(0.45, 0.55, 0.45, 0.55))
+
+
+
+```
+
+We can now being to investigate patterns of gene expression in the data (Figure \@ref(fig:dmap-genes)). Two tips can be accounted for by our origin tissues - with *Ttr* marking the visceral endoderm, and *Mixl1* marking cells emerging from the primitive streak.
+
+```{r dmap-genes, fig.cap = "Gene expression patterns that mark the early embryonic tissues."}
+
+dmap_ttr = plot_expr(dmap$DC1, dmap$DC2, "Ttr")
+dmap_mixl = plot_expr(dmap$DC1, dmap$DC2, "Mixl1")
+
+
+
+plot_grid(dmap_ttr, dmap_mixl, ncol = 2, labels = "AUTO")
+
+
+```
+
+Moreover, inspection of diffusion component 3 reveals some of the specialisation of later gut tissues: *Cdx2* marks the hindgut, *Nepn* the midgut, *Pyy* the foregut, and *Nkx2-5* the pharyngeal endoderm. We will return to these tissues in greater detail later in this document.
+
+```{r dmap-gut, fig.wide = TRUE, fig.cap = "Gene expression patterns that mark the tissues of the embryonic gut."}
+
+dmap_cdx = plot_expr(dmap$DC1, dmap$DC3, "Cdx2", labels = c("DC1", "DC3"))
+dmap_nepn = plot_expr(dmap$DC1, dmap$DC3, "Nepn", labels = c("DC1", "DC3"))
+dmap_pyy = plot_expr(dmap$DC1, dmap$DC3, "Pyy", labels = c("DC1", "DC3"))
+dmap_nkx = plot_expr(dmap$DC1, dmap$DC3, "Nkx2-5", labels = c("DC1", "DC3"))
+
+plot_grid(dmap_cdx, dmap_nepn, dmap_pyy, dmap_nkx)
+
+```
+
+Finally, we also show the expression of a set of genes that were considered in a recent publication on endoderm formation and intercalation (Viotti et al. 2014) in Figure \@ref(fig:viotti-genes).
+
+```{r viotti-genes, fig.wide=TRUE, fig.cap = "Genes considered in Viotti et al 2014. Afp was used to mark VE cells; Sox17 and Foxa2 were used to mark DE cells that were preparing to egress or were actively egressing; Cdh1 was observed in cells that either had egressed or had aborted an egression attempt."}
+
+afp_plot = plot_expr(dmap$DC1, dmap$DC2, "Afp")
+sox_plot = plot_expr(dmap$DC1, dmap$DC2, "Sox17")
+foxa_plot = plot_expr(dmap$DC1, dmap$DC2, "Foxa2")
+cdh_plot = plot_expr(dmap$DC1, dmap$DC2, "Cdh1")
+
+plot_grid(afp_plot, sox_plot, foxa_plot, cdh_plot, ncol = 2, labels = "AUTO")
+
+
+```
+
+```{r save-plots-dmap}
+
+ggsave(dmap_stage + no_ticks,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_stage.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_celltype + no_ticks,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_celltype.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_ttr + no_ticks + ggtitle("Ttr") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_ttr.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_mixl + no_ticks + ggtitle("Mixl1") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_mixl.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_celltype_2 + no_ticks,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_celltype_dc3.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_stage_2 + no_ticks,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_stage_dc3.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_cdx + no_ticks + ggtitle("Cdx2") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_cdx.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_nepn + no_ticks + ggtitle("Nepn") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_nepn.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_nkx + no_ticks + ggtitle("Nkx2-5") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_nkx.pdf",
+       width = 6, height = 4)
+
+ggsave(dmap_pyy + no_ticks + ggtitle("Pyy") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_pyy.pdf",
+       width = 6, height = 4)
+
+```
+
+### Force directed graph
+
+In order to summarise this information into two dimensions, we have also generated a force-directed layout of a graph built from the diffusion embedding. Specifically, the graph is a KNN structure, connecting each cell to its ten nearest neighbours in the first fifteen diffusion components. The celltype and stage information for these cells is shown in Figure \@ref(fig:graph).
+
+```{r graph, fig.wide = TRUE, fig.cap = "Force-directed layout of a K-nearest neighbour graph built from the first 15 diffusion components."}
+
+graph_df = read.table("/nfs/research1/marioni/jonny/embryos/scripts/endoderm/gephi.tab", header = TRUE, sep = "\t")
+
+graph_celltype = ggplot(mapping = aes(x = graph_df$gephiX[no], y= graph_df$gephiY[no], col = sub_meta$celltype[no])) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = celltype_colours, name = "Celltype") +
+  labs(x = "DC1", y = "DC2") +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+
+
+graph_stage = ggplot(mapping = aes(x = graph_df$gephiX[no], y= graph_df$gephiY[no], col = sub_meta$stage[no])) +
+  geom_point(size = 0.7) +
+  scale_color_manual(values = stage_colours, labels = stage_labels, name = "Timepoint") +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+
+plot_grid(graph_celltype, graph_stage)
+
+
+```
+
+Marker gene expression is shown in Figure \@ref(fig:graph-genes).
+
+
+```{r graph-genes,fig.height= 10, fig.cap = "Marker gene expression on the force-directed layout" }
+
+theme = theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+
+graph_ttr = plot_expr(graph_df$gephiX, graph_df$gephiY, "Ttr") + theme
+graph_mixl = plot_expr(graph_df$gephiX, graph_df$gephiY, "Mixl1") + theme
+graph_cdx = plot_expr(graph_df$gephiX, graph_df$gephiY, "Cdx2") + theme
+graph_nepn = plot_expr(graph_df$gephiX, graph_df$gephiY, "Nepn") + theme
+graph_pyy = plot_expr(graph_df$gephiX, graph_df$gephiY, "Pyy") + theme
+graph_nkx = plot_expr(graph_df$gephiX, graph_df$gephiY, "Nkx2-5") + theme
+
+plot_grid(graph_ttr, graph_mixl, graph_cdx, graph_nepn, graph_pyy, graph_nkx, nrow = 3)
+
+```
+
+
+```{r save-graph-plots}
+
+ggsave(graph_ttr + no_title + ggtitle("Ttr") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_ttr.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_mixl + no_title + ggtitle("Mixl1") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_mixl.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_celltype + no_title,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_celltype.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_stage + no_title,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_stage.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_cdx + no_title + ggtitle("Cdx2") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_cdx.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_nepn + no_title + ggtitle("Nepn") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_nepn.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_nkx + no_title + ggtitle("Nkx2-5") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_nkx.pdf",
+       width = 6, height = 4)
+
+ggsave(graph_pyy + no_title + ggtitle("Pyy") + theme(plot.title = element_text(face = "bold.italic")),
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/graph_pyy.pdf",
+       width = 6, height = 4)
+
+```
+
+# Classification of late gut cells
+
+To define the structure of the cell transcrtopes of the embryonic gut, we now classify the gut cells using the data in our two latest timepoints: E8.5 and E8.25. These cells are highlighted in Figure \@ref(fig:highlight-85).
+
+```{r highlight-85, fig.cap = "Cells selected for gut clustering."}
+
+keep = sub_meta$stage %in% c("E8.5", "E8.25") & sub_meta$celltype == "Gut"
+
+qplot(dmap$DC1[order(keep)], dmap$DC3[order(keep)], col = keep[order(keep)]) +
+  geom_point() +
+  scale_colour_manual(values = c("TRUE" = "red", "FALSE" = "darkgrey"), 
+                      labels = c("TRUE" = "E8.5 & E8.25", "FALSE" = "Other"),
+                      name = "") +
+  labs(x = "DC1", y= "DC3")
+
+late_sce = scater::normalize(sub_sce[,keep])
+late_corrected = corrected[keep,]
+late_meta = sub_meta[keep,]
+late_dmap = DiffusionMap(late_corrected)
+
+```
+
+These cells are projected via diffusion map in Figure \@ref(fig:85-dmap). This diffusion map was calculated from subsetted PC coordinates from the batch-correction performed above. Clusters are highlighted by colour; clusters were determined using Louvain clustering (`igraph::cluster_louvain`) on a shared nearest neighbour graph (`scran::buildSNNGraph`) both with default parameters. Tables of the top marker genes for each cluster are shown in Table \@ref(tab:85-dmap).
+
+```{r 85-dmap, fig.wide = TRUE, fig.cap = "Gut cells from the final two timepoints are shown, coloured by their newly-calculated cluster and their collection timepoint.", message = FALSE}
+
+set.seed(42)
+graph = buildSNNGraph(late_corrected, d= NA, transposed = TRUE)
+late_clusts = as.numeric(membership(cluster_louvain(graph)))
+
+p1 = qplot(late_dmap$DC1, late_dmap$DC2, col = factor(late_clusts)) +
+  scale_colour_Publication(name = "Cluster") +
+  labs(x = "DC1", y = "DC2")
+
+ro = sample(nrow(late_meta), nrow(late_meta))
+p2 = qplot(late_dmap$DC1[ro], late_dmap$DC2[ro], col = factor(late_meta$stage)[ro]) +
+  scale_colour_Publication(name = "Stage") +
+  labs(x = "DC1", y = "DC2")
+
+plot_grid(p1, p2)
+
+
+markers = findMarkers(late_sce, clusters = factor(late_clusts), block = late_meta$sample, direction = "up", pval.type = "all", subset.row = calcAverage(late_sce) > 0.1)
+
+
+top = sapply(markers, function(x){
+  genes[match(head(rownames(x), n = 10), genes[,1]), 2]
+})
+
+kable(top, caption = "Top marker genes for the gut clusters.")
+
+# test = lapply(markers, function(x){
+#   hit = head(rownames(x), n = 30)
+#   enrich_genes_goana(hit, rownames(x), warn_missing = FALSE)
+# })
+# 
+# test = lapply(test, function(x) x$result)
+
+```
+
+Cluster 3 very highly expresses the gene gene *Hhex*, which marks the foregut. This is shown in Figure \@ref(fig:85-genes-hhex).
+
+```{r 85-genes-hhex, fig.cap = "Hhex expression in the gut cell subset."}
+
+
+expr_boxplot = function(gene, clusters = late_clusts, sce = late_sce, genes_df = genes){
+  pdf = data.frame(clust = clusters, expr = logcounts(sce)[match(gene, genes_df[,2]),])
+
+  p = ggplot(pdf, aes(x = factor(clust), y = expr)) +
+    geom_boxplot() +
+    labs(x = "Cluster", y = paste(gene, "log2 expression"))
+
+  return(p)
+}
+
+gut_plot = function(gene_name){
+  p1 = plot_expr(late_dmap$DC1, late_dmap$DC2, gene_name, c("DC1", "DC2"), late_sce)
+  p2 = expr_boxplot(gene_name)
+  
+  plot_grid(p1, p2)
+}
+
+gut_plot("Hhex")
+
+```
+
+This cluster also expresses the gene *Ttr* (Figure \@ref(fig:85-genes-ttr), a liver progenitor marker), and the ventral foregut marker *Gata4* (Figure \@ref(fig:85-genes-gata4); [ref1](https://www.ncbi.nlm.nih.gov/pubmed/9136932) [ref2](https://www.ncbi.nlm.nih.gov/pubmed/9136933)). We label cluster 3 as Foregut 1.
+
+
+```{r 85-genes-ttr, fig.cap = "Ttr expression in the gut cell subset."}
+
+gut_plot("Ttr")
+
+cluster_labels = c()
+
+```
+
+```{r 85-genes-gata4, fig.cap = "Gata4 expression in the gut cell subset."}
+
+gut_plot("Gata4")
+cluster_labels = c(cluster_labels, "3" = "Foregut 1")
+
+frac_3 = sum(late_meta$stage == "E8.25" & late_clusts == 3)/sum(late_clusts == 3)
+frac_1 = sum(late_meta$stage == "E8.25" & late_clusts == 1)/sum(late_clusts == 1)
+
+```
+
+
+Cluster 1 expresses *Irx1*, linked to lung development (Figure \@ref(fig:85-genes-irx1); [reference](https://www.ncbi.nlm.nih.gov/pubmed/11472847)) and *Hmgn3* and, linked to pancreas development (Figure \@ref(fig:85-genes-hmgn3); [reference](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2747976)). Note also that this cluster contains a considerably larger fraction of E8.25 cells than cluster 3 (`r round(frac_1 * 100)`% vs `r round(frac_3 * 100)`%), and it is therefore likely that this cluster also contains younger foregut cells. We label these cells as Foregut 2.
+
+```{r 85-genes-irx1, fig.cap = "Irx1 expression in the gut cell subset."}
+
+gut_plot("Irx1")
+
+```
+
+```{r 85-genes-hmgn3, fig.cap = "Hgmn3 expression in the gut cell subset."}
+
+gut_plot("Hmgn3")
+cluster_labels = c(cluster_labels, "1" = "Foregut 2")
+
+```
+
+Cluster 4 highly expresses *Nepn* (a midgut marker, Figure \@ref(fig:85-genes-nepn), [ref](https://www.sciencedirect.com/science/article/pii/S0012160609013323)), so we label these cells as midgut.
+
+```{r 85-genes-nepn, fig.cap = "Nepn expression in the gut cell subset."}
+
+gut_plot("Nepn")
+cluster_labels = c(cluster_labels, "4" = "Midgut")
+
+```
+
+Both clusters 7 and 5 highly express *Cdx2*, a marker of the hindgut (Figure \@ref(fig:85-genes-cdx2)). We label these clusters as Hindgut 1 and 2 respectively
+
+```{r 85-genes-cdx2, fig.cap = "Cdx2 expression in the gut cell subset."}
+
+gut_plot("Cdx2")
+cluster_labels = c(cluster_labels, "7" = "Hindgut 1", "5" = "Hindgut 2")
+
+```
+
+Cluster 2 expresses *Nkx2-5* (Figure \@ref(fig:85-genes-nkx)), which indicates that it is pharyngeal endoderm.
+
+```{r 85-genes-nkx, fig.cap = "Nkx2-5 expression in the gut cell subset."}
+
+gut_plot("Nkx2-5")
+cluster_labels = c(cluster_labels, "2" = "Pharyngeal endoderm")
+
+```
+
+
+Cluster 6 sits between the midgut and hindgut clusters, but note that it expresses intermediate levels of the markers for each (Figures \@ref(fig:85-genes-cdx2) for *Cdx2*, \@ref(fig:85-genes-nepn) for *Nepn*). We therefore label these cells as intermediate midgut/hindgut cells.
+
+```{r label-6}
+
+cluster_labels = c(cluster_labels, "6" = "Midgut/Hindgut")
+
+cluster_labels = cluster_labels[order(names(cluster_labels))]
+
+cluster_colours = c(brewer_pal(palette = "Dark2")(length(cluster_labels)))
+names(cluster_colours) = names(cluster_labels)
+
+named_cluster_colours = cluster_colours
+names(named_cluster_colours) = cluster_labels
+
+cluster_levels = c(7, 5, 6, 4, 1, 3, 2)
+
+```
+
+A summary of these classifications is shown in Figure \@ref(fig:summary), including some additional marker genes.
+
+```{r summary, fig.cap = "Expression patterns for each annotated cluster is shown. The mean log-expression is plotted, normalised by the maximum mean expression per gene."}
+
+get_gene_means = function(gene, gene_df = genes, sce_obj = sce, celltypes = meta$celltype){
+  ens = as.character(genes[match(gene, genes[,2]),1])
+  expr = as.numeric(logcounts(sce_obj[ens,]))
+  medians = aggregate(formula = expr ~ celltypes, FUN = mean)
+  mat = matrix(medians$expr, nrow = 1, dimnames = list(gene, medians$celltypes))
+  return(mat)
+}
+
+targets = c("Nepn", "Cdx2", "Nkx2-5", "Isl1", "Hmgn3", "Irx1", "Gata4", "Ttr", "Hhex", "Foxe1", "Pax9")
+means = lapply(targets, get_gene_means, sce_obj = late_sce, celltypes = cluster_labels[as.character(late_clusts)])
+combined = do.call(rbind,means)
+combined = sweep(combined, 1, apply(combined, 1, max), "/")
+
+# heatmap_late = pheatmap(combined, cluster_rows = TRUE, cluster_cols = TRUE, color = viridis::viridis(100))
+
+geneclust = hclust(dist(combined))
+gene_order = geneclust$labels[geneclust$order]
+clust_order = c("Hindgut 1", "Hindgut 2", "Midgut/Hindgut", "Midgut", "Foregut 1", "Foregut 2", "Pharyngeal endoderm")
+
+pdf = melt(combined[gene_order, clust_order])
+heatmap_late = ggplot(pdf, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_viridis(labels = c(0,"Max."), breaks = c(0,1), name = "Mean\nexpression") +
+  theme(axis.title = element_blank(), 
+        axis.line = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = -30, hjust = 0))
+
+heatmap_late
+
+```
+
+This gives the following labelling of the late gut cells, shown in Figure \@ref(fig:gut-labelled)
+
+```{r gut-labelled, fig.cap = "Diffusion map of gut cells, coloured and labelled by assigned cluster"}
+
+late_dmap_labelled = qplot(late_dmap$DC1, late_dmap$DC2, col = factor(late_clusts)) +
+  scale_colour_manual(name = "Cluster", values = cluster_colours, labels = cluster_labels) +
+  guides(colour = guide_legend(override.aes = list(size = 5))) +
+  labs(x = "DC1", y = "DC2")
+
+late_dmap_labelled
+
+ggsave(late_dmap_labelled,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/gut_cells_dmap.pdf",
+       width = 6, height = 4)
+
+```
+
+Finally, we show and enlarged heatmap in Figure \@ref(fig:heatmap-big) that includes the top 10 unqiuely expressed genes for each cluster (as found using `scran::findMarkers`).
+
+```{r heatmap-big, fig.wide = TRUE, fig.cap = "The expression of the top 10 DE genes for each cluster is shown.", fig.height = 20}
+
+targets = as.character(top)
+means = lapply(targets, get_gene_means, sce_obj = late_sce, celltypes = cluster_labels[as.character(late_clusts)])
+combined = do.call(rbind,means)
+combined = sweep(combined, 1, apply(combined, 1, max), "/")
+
+# heatmap_late = pheatmap(combined, cluster_rows = TRUE, cluster_cols = TRUE, color = viridis::viridis(100))
+
+geneclust = hclust(dist(combined))
+gene_order = geneclust$labels[geneclust$order]
+clust_order = c("Hindgut 1", "Hindgut 2", "Midgut/Hindgut", "Midgut", "Foregut 1", "Foregut 2", "Pharyngeal endoderm")
+
+pdf = melt(combined[gene_order, clust_order])
+ggplot(pdf, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  scale_fill_viridis(labels = c(0,"Max."), breaks = c(0,1), name = "Mean\nexpression") +
+  theme(axis.title = element_blank(), 
+        axis.line = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = -30, hjust = 0))
+
+
+```
+
+# Spatial gene expression dynamics of the gut tube
+
+The embryonic gut runs along the length of the embryo. Given the whole-embryo sampling that we have performed, it should be possible to use the transcriptional heterogeneity observed in the gut cells to order them along this axis. To do this, we consider only the E8.5 cells (to exclude effects of development over time), and recomputed a diffusion map with these cells. To order the cells, we computed DPT from the pharyngeal endoderm cell with most extreme DC2 value. In Figure \@ref(fig:gut-dmap), the first two components of the diffusion map are shown, the DPT on these diffusion components, as well as the density of cells of different celltypes along the DPT.
+
+```{r gut-dmap, fig.wide = TRUE, fig.cap = "Ordering of gut cells along diffusion components. A: Gut cells projected via diffusion maps. The black coloured cell indicates the DPT starting position. B: Gut cells projected via diffusion maps, coloured by DPT value. C: Ordering of gut clusters along DPT."}
+
+keep = late_meta$stage == "E8.5"
+gut_sce = scater::normalize(late_sce[,keep])
+gut_meta = late_meta[keep,]
+gut_corrected = late_corrected[keep,]
+gut_clusts = late_clusts[keep]
+
+set.seed(42)
+gut_dmap = DiffusionMap(gut_corrected)
+gut_dpt = DPT(gut_dmap)
+gut_dpt = gut_dpt[[paste0("DPT", which.min(gut_dmap$DC2))]]
+
+p1 = ggplot(mapping = aes(x = gut_dmap$DC1, y= gut_dmap$DC2, col = factor(gut_clusts)))+
+  geom_point() +
+  geom_point(mapping = aes(x = gut_dmap$DC1[which.min(gut_dmap$DC2)], y = min(gut_dmap$DC2)), col = "black", size = 3, inherit.aes = FALSE) +
+  scale_color_manual(values = cluster_colours, labels = cluster_labels, name = "") +
+  labs(x = "DC1", y = "DC2") +
+  theme(legend.position = "none")
+
+p2 = ggplot(mapping = aes(x = gut_dmap$DC1, y= gut_dmap$DC2, col = gut_dpt))+
+  geom_point() +
+  scale_color_viridis(name = "DPT") +
+  labs(x = "DC1", y = "DC2") 
+
+gut_density = ggplot(mapping = aes(x = gut_dpt, fill = factor(gut_clusts, levels = cluster_levels, ordered = TRUE)))+
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = cluster_colours, labels = cluster_labels, name = "") +
+  theme(legend.position = c(0.0, 0.8))
+
+plot_grid(plot_grid(p1, p2, labels = "AUTO"), 
+          gut_density, nrow = 2, labels = c(NULL, "C"))
+  
+ggsave(gut_density,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/gut_spatial_density.pdf",
+       width = 6, height = 4)
+
+
+
+```
+
+Having ordered cells along the first diffusion component, we now seek to identify how different genes are changing along this path. These genes may help to explain the molecular underpinnings of the contribution of these two groups of cells. We use the following procedure (similar to [Ibarra-Soria et al. 2017](https://www.ncbi.nlm.nih.gov/pubmed/29311656) ):
+
+1. Calculate highly variable genes for the cell subset. Retain only highly-variable genes. Genes that are not especially variable over these set of cells are unlikely to be variable over DPT.
+
+2. For each retained gene, create two linear models that regress the log2 normalised expression levels for each cell against the values of DPT calculated above. The first model considers the expression as a constant across all DPT values. The second model considers expression as a degree-2 polynomial function of the DPT value. Retain the genes for which the degree-2 polynomial fits the data better (F-test p < 0.05, *R* function `anova.lm`). We consider these genes to vary over DPT.
+
+3. To each gene, fit a local regression to the expression level for each cell at each value of DPT (*R* function `loess`, span = 0.75). Store the predicted value of the loess fit for one thousand equally spaced points across the DPT to smooth the data. By using equally spaced points, this prevents gene clustering being determined exclusively by locations with high cell density.
+
+4. Normalise the fitted trends such that the minimum value is 0, and the maximum value is 1. This prevents clustering of genes according to global expression levels, rather than local expression patterns.
+
+5. To cluster the fitted expression profiles, calculate the pearson correlation distance between each gene, and perform hierarchical clustering using the average agglomeration method (UPGMA). Cut the tree using the *R* package `dynamicTreeCut`, with a minimum cluster size of 50 genes.
+
+The gene clusters identified in this manner are shown in Figure \@ref(fig:spatial).
+
+```{r gene_functions}
+
+#This function determines the expression trajectories for clustering
+get_predict = function(count, dpt,
+                       model_mode = c("loess", "quadratic"),
+                       predict_mode = c("cells", "even")){
+  if(model_mode[1] == "loess"){
+    model = loess(count ~ dpt)
+    newdat = data.frame(dpt = dpt)
+    if(predict_mode[1] == "even"){
+      newdat = data.frame(dpt = seq(from = min(dpt), to = max(dpt), length.out = 1000))
+    }
+  } else if(model_mode[1] == "quadratic"){
+    dpt2 = dpt^2
+    model = lm(count ~ dpt + dpt2)
+    newdat = data.frame(dpt = dpt, dpt2 = dpt2)
+    if(predict_mode[1] == "even"){
+      newdat = data.frame(dpt = seq(from = min(dpt), to = max(dpt), length.out = 1000),
+                          dpt2 = seq(from = min(dpt), to = max(dpt), length.out = 1000)^2)
+    }
+  }
+
+
+
+  pred = predict(model, newdata = newdat)#, dpt2 = coords^2))
+
+  return(pred)
+}
+
+#This function identtifies genes that vary, and performs clustering
+get_gene_clusters = function(sce, dpt, seed = 42, predict_even = TRUE, normalise = TRUE, model_mode = c("loess", "quadratic")){
+  require(dynamicTreeCut)
+  set.seed(seed)
+
+  #find genes that vary along DPT
+  dpt2 = dpt^2
+  retain = sapply(1:nrow(sce), function(x){
+    expr = logcounts(sce)[x,]
+
+
+    mod = lm(expr ~ dpt + dpt2)
+    base = lm(expr ~ 1)
+
+    # dAIC = AIC(mod) - AIC(base)
+    # return(dAIC < -25)
+
+    anova = anova(base,mod)
+
+    return(anova$`Pr(>F)`[2])
+    })
+
+  retain = p.adjust(retain, "fdr") < 0.05
+
+  sce = sce[retain,]
+
+  #fit the genes that vary
+  predict_mode = ifelse(predict_even, "even", "cells")
+  predicts = lapply(1:nrow(sce), function(x) get_predict(as.numeric(logcounts(sce)[x,]),
+                                                         dpt,
+                                                         predict_mode = predict_mode,
+                                                         model_mode = model_mode[1]))
+
+  predicts = do.call(cbind, predicts)
+  if(normalise){
+    #shift minimum value to 0
+    predicts = sweep(predicts,
+                     2,
+                     matrixStats::colMins(predicts),
+                     "-")
+    #scale to max 1
+    predicts = sweep(predicts,
+                       2,
+                       matrixStats::colMaxs(predicts),
+                       "/")
+  }
+  colnames(predicts) = rownames(sce)
+
+  #cluster
+  dm = sqrt( (1- cor(predicts, method = "pearson")) /2)
+  # dm = as.matrix(dist(t(predicts)))
+  hclust = hclust(as.dist(dm), method = "average")
+  clusts = cutreeDynamic(dendro = hclust, minClusterSize = 50, distM = dm)
+  names(clusts) = colnames(predicts)
+
+  return(list(clusters = clusts, hclust = hclust, predictions = predicts, dpt = dpt, expression = logcounts(sce)))
+
+}
+
+plot_cluster_averages = function(get_gene_clusters_out, predict_even = FALSE){
+  input = get_gene_clusters_out
+  means = sapply(1:length(unique(input$clusters)), function(x){
+    rowMeans(input$predictions[,input$clusters==x])
+    })
+
+  pdf = melt(means)
+  names(pdf) = c("cellnum", "cluster", "val")
+  
+  if(predict_even){
+    pdf$dpt = pdf$cellnum
+  } else{
+    pdf$dpt = input$dpt[pdf$cellnum]
+  }
+  
+  pdf$sd = sapply(1:nrow(pdf), function(x){
+    sd(input$predictions[pdf$cellnum[x],
+                         input$clusters == pdf$cluster[x]])
+  })
+
+  plots = lapply(1:length(unique(pdf$cluster)), function(x){
+    ggplot(pdf[pdf$cluster == x,], aes(x= dpt, y = val)) +
+      geom_ribbon(mapping = aes(ymin = val-sd, ymax = val + sd), fill = "grey80") +
+      geom_line() +
+      theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank()) +
+      ggtitle(paste0(x, " (n=", sum(input$cluster==x),")" ))
+  })
+
+  return(plot_grid(plotlist = plots))
+
+}
+
+```
+
+```{r spatial, fig.cap = "Summaries of the detected gut gene clusters are shown. The black line indicated the mean value across genes for every observed DC1 coordinate; grey shading indicates the standard deviation at each value.", message = FALSE, warning = FALSE,results='hide',fig.keep='all'}
+
+gut_hvgs = getHVGs(gut_sce)
+
+clusters_gut = get_gene_clusters(gut_sce[gut_hvgs,], 
+                                 gut_dpt, 
+                                 seed = 42, 
+                                 predict_even = TRUE, 
+                                 normalise = TRUE,
+                                 model_mode = "loess")
+
+
+clusters_gut_plot = plot_cluster_averages(clusters_gut, predict_even = TRUE)
+
+clusters_gut_plot
+
+ggsave(clusters_gut_plot,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/gut_gene_clusters.pdf",
+       width = 8, height = 8)
+
+df = data.frame(ensembl = names(clusters_gut$clusters),
+                mgi = genes[match(names(clusters_gut$clusters), genes[,1]),2],
+                cluster = clusters_gut$clusters)
+
+write.table(df, row.names = FALSE, quote = FALSE, sep = ",", file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/gut_spatial_gene_clustering.csv")
+
+```
+
+
+```{r gut-enrich}
+
+expressed = names(calcAverage(gut_sce)[calcAverage(gut_sce) > 0.1])
+
+enrich_gut = lapply(unique(clusters_gut$clusters), function(x){
+  enrich = enrich_genes_goana(hits = names(clusters_gut$clusters)[clusters_gut$clusters == x],
+                              universe = expressed,
+                              warn_missing = FALSE)$result
+  enrich = enrich[enrich$Ont == "BP", ]
+  enrich$FDR = p.adjust(enrich$P.DE, method = "fdr")
+  enrich$cluster = x
+  return(enrich)
+})
+
+enrich_gut = do.call(rbind, enrich_gut)
+
+write.table(enrich_gut, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/gut_enrichments.csv",
+            sep = ",", quote = FALSE, col.names = TRUE, row.names = TRUE)
+
+```
+
+# Identifying developmental trajectories
+
+It has been previously reported that cells from the visceral endoderm make contributions to the embryonic gut ([Kwon et al. 2008](https://www.ncbi.nlm.nih.gov/pubmed/18854136)). Moreover, the greatest contribution of these cells has been observed in the Hindgut (at E8.75). Can we see this in our data?
+
+To probe this further, we will build a transport map between cells at different timepoints using [Waddington-OT](https://www.biorxiv.org/content/early/2017/09/27/191056). In addition, we exclude the Mixed timepoint (as these cells were not synchronously harvested), and we add 100 extraembryonic endoderm cells from each timepoint, to allow cell mass from the visceral endoderm to contribute to both extrambryonic tissues and the embryonic gut.
+
+A diffusion map of these cells is shown in Figure \@ref(fig:cells-kept). A batch corrected PCA was recomputed for these cells, which is used to build the transport map.
+
+```{r big-sce}
+
+keep = meta$cell %in% sub_meta$cell & meta$stage != "mixed_gastrulation"
+set.seed(42)
+alt = lapply(unique(sub_meta$stage), function(x){
+  sample(which(meta$celltype == "ExE endoderm" & meta$stage == x),
+         min(c(100, sum(meta$celltype == "ExE endoderm" & meta$stage == x, na.rm = TRUE))))
+})
+alt = do.call(c, alt)
+keep[alt] = TRUE
+keep[meta$stage == "mixed_gastrulation"] = FALSE
+
+
+big_sce = scater::normalize(sce[, keep])
+big_meta = meta[keep,]
+
+big_hvgs = getHVGs(big_sce)
+
+order_df = big_meta[!duplicated(big_meta$sample), c("stage", "sample")]
+order_df$ncells = sapply(order_df$sample, function(x) sum(big_meta$sample == x))
+order_df$stage = factor(order_df$stage,
+                        levels = rev(c("E8.5",
+                                   "E8.25",
+                                   "E8.0",
+                                   "E7.75",
+                                   "E7.5",
+                                   "E7.25",
+                                   "mixed_gastrulation",
+                                   "E7.0",
+                                   "E6.75",
+                                   "E6.5")))
+order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+order_df$stage = as.character(order_df$stage)
+
+set.seed(42)
+big_corrected = doBatchCorrect(counts = logcounts(big_sce)[rownames(big_sce) %in% big_hvgs,],
+                             timepoints = big_meta$stage,
+                             samples = big_meta$sample,
+                             timepoint_order = order_df$stage,
+                             sample_order = order_df$sample,
+                             npc = 50)
+
+big_dmap = DiffusionMap(big_corrected)
+save(big_corrected, big_sce, big_meta, big_dmap, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/big_data.RData")
+
+
+load("/nfs/research1/marioni/jonny/embryos/scripts/endoderm/big_data.RData")
+
+```
+
+```{r cells-kept, fig.wide = FALSE, fig.height = 8, fig.cap = "Cells retained for transport map, coloured by celltype (A), stage (B)."}
+
+exe = big_meta$cell[big_meta$stage %in% c("E8.25", "E8.5") &
+                      big_meta$celltype == "ExE endoderm"]
+
+ro = sample(nrow(big_meta), nrow(big_meta))
+
+big_celltype = qplot(big_dmap$DC1[ro], big_dmap$DC2[ro], col = big_meta$celltype[ro]) +
+  scale_colour_manual(values = celltype_colours, name = "Celltype")+
+  labs(x = "DC1", y = "DC2")  +
+  guides(col = guide_legend(override.aes = list(size = 3)))
+
+big_stage = qplot(big_dmap$DC1[ro], big_dmap$DC2[ro], col = big_meta$stage[ro]) +
+  scale_colour_manual(values = stage_colours, name = "Stage")+
+  labs(x = "DC1", y = "DC2")  +
+  guides(col = guide_legend(override.aes = list(size = 3)))
+
+plot_grid(big_celltype, big_stage, ncol = 1, labels = "AUTO", align = "v")
+
+ggsave(big_celltype,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_exe_celltype.pdf",
+       width = 8, height = 5)
+
+ggsave(big_stage,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/dmap_exe_stage.pdf",
+       width = 7, height = 5)
+
+
+
+```
+
+We now build the transport map.
+
+```{r fateid, message = FALSE, warning = FALSE, results = "hide"}
+
+# wot_pca = corrected
+wot_pca = big_corrected
+rownames(wot_pca) = NULL
+colnames(wot_pca) = paste0("PC", 1:50)
+wot_pca = cbind(data.frame("id" = big_meta$cell), as.data.frame(wot_pca))
+wot_pca_loc = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/pca.tab"
+write.table(wot_pca, 
+            file = wot_pca_loc, 
+            col.names = TRUE, 
+            row.names = FALSE, 
+            quote = FALSE, 
+            sep = "\t")
+
+#prepare day metadata
+wot_days = data.frame(id= big_meta$cell, day = substr(big_meta$stage, start = 2, stop = nchar(big_meta$stage)))
+wot_day_loc = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/days.tab"
+write.table(wot_days, 
+            file = wot_day_loc, 
+            col.names = TRUE, 
+            row.names = FALSE, 
+            quote = FALSE, 
+            sep = "\t")
+
+#compute the transport maps
+wot_out_loc = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/"
+command = paste("wot optimal_transport --max_threads 1 --local_pca 0 --out", wot_out_loc, "--format loom --matrix", wot_pca_loc,  "--cell_days", wot_day_loc)
+#this was run separately
+# system(command)
+
+```
+
+## Moving forward through the map
+
+What can we do using these transport maps? First, we will move forward through the maps, identifying how cell mass falls in the gut clusters (identified above) from populations of visceral and definitive endoderm cells at E7.0 (where the definitive endoderm set also includes anterior primitive streak cells). The cells selected, and results of the analysis, are shown in Figure \@ref(fig:push). We classified cells as visceral endoderm-derived if they derived more mass from the visceral endoderm starting population than the definitive endoderm population.
+
+```{r push, fig.cap = "Results of pushing forward through the transport map. A: Starting cells at E7.0 are shown. B: Cell allocations to the according to the mass contributed from starting populations. C: Number of cells allocated to each origin in the mature gut clusters. D: Distributions of mass ratios in the late gut clusters.", fig.wide = TRUE, fig.height = 10, warning = FALSE, message = FALSE}
+
+#cells at which stages
+
+ve_cells  = big_meta$cell[big_meta$stage == "E7.0" & big_meta$celltype == "Visceral endoderm"]
+string1 = paste("VE", "VE", paste0(ve_cells, collapse = "\t"), sep = "\t")
+
+de_cells  = big_meta$cell[big_meta$stage == "E7.0" & (big_meta$celltype == "Def. endoderm" |
+                                                        big_meta$celltype == "Anterior Primitive Streak")]
+string2 = paste("DE", "DE", paste0(de_cells, collapse = "\t"), sep = "\t")
+
+wot_target_loc = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/forward_targets.gmt"
+wot_forward_out = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/forward_output.txt"
+write.table(c(string1, string2), file = wot_target_loc, col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+command = paste("wot trajectory --tmap", wot_out_loc, "--cell_set", wot_target_loc, "--time 7.0 --out", wot_forward_out)
+#this was run separately
+# system(command)
+
+
+
+col = sapply(sub_meta$cell, function(x){
+  if(x %in% ve_cells){
+    return("VE")
+  } else if(x %in% de_cells){
+    return("DE")
+  } else {
+    return("Neither")
+  }
+})
+col = factor(col, levels = c("Neither", "VE", "DE"))
+order = order(col)
+
+p1= ggplot(graph_df[order,], aes(x = gephiX, y= gephiY, col = col[order])) +
+  geom_point() +
+  scale_colour_manual(values = c("DE" = "seagreen4", "VE" = "coral", "Neither" = "darkgrey"), name = "") +
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+wot_forward = read.table(wot_forward_out, sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+sub_meta$forward_ratio = (wot_forward$DE/wot_forward$VE)[match(sub_meta$cell, wot_forward$id)]
+
+p2 = ggplot(graph_df, aes(x = gephiX, y= gephiY, col = sub_meta$forward_ratio > 1)) +
+  geom_point() +
+  scale_colour_manual(values = c("TRUE" = "seagreen4", "FALSE" = "coral"), labels = c("TRUE" = "DE", "FALSE" = "VE"), name = "")+
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+late_meta$cluster.name = cluster_labels[late_clusts]
+late_meta$origin = ifelse(sub_meta$forward_ratio[match(late_meta$cell, sub_meta$cell)] > 1, "DE", "VE")
+
+tab = table(late_meta$cluster.name, late_meta$origin)
+tab = sweep(tab, 1, rowSums(tab), "/")
+
+wot_forward$stage = meta$stage[match(wot_forward$id, meta$cell)]
+wot_forward$celltype = meta$celltype[match(wot_forward$id, meta$cell)]
+wot_forward$origin = ifelse(wot_forward$DE > wot_forward$DE, "DE", "VE")
+
+df = as.data.frame(tab)
+
+ps = data.frame(Var1 = "ExE endoderm", 
+           Var2 = c("DE", "VE"), 
+           Freq = c(sum(wot_forward$origin[wot_forward$celltype == "ExE endoderm" &
+                                             wot_forward$stage %in% c("E8.25", "E8.5")] == "DE"),
+                    sum(wot_forward$origin[wot_forward$celltype == "ExE endoderm" &
+                                             wot_forward$stage %in% c("E8.25", "E8.5")] == "VE")))
+
+ps$Freq = ps$Freq/sum(ps$Freq)
+df = rbind(df, ps)
+
+p3 = ggplot(data = df, mapping = aes(x = factor(Var1,
+                                                levels = c("Pharyngeal endoderm",
+                                                           "Foregut 2",
+                                                           "Foregut 1",
+                                                           "Midgut",
+                                                           "Midgut/Hindgut",
+                                                           "Hindgut 2",
+                                                           "Hindgut 1",
+                                                           "ExE endoderm"),
+                                                ordered = TRUE), 
+                                     fill = Var2, 
+                                     y = Freq)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("DE" = "seagreen4", "VE" = "coral"), name = "") +  
+  theme(axis.text.x = element_text(angle = -30, hjust = 0),
+        axis.title.x = element_blank())
+
+
+tab2 = melt(rbind(table(late_meta$cluster.name, late_meta$origin), ps))
+
+outcome_numbers = ggplot(data = tab2, mapping = aes(x = factor(Var1,
+                                                levels = c("Pharyngeal endoderm",
+                                                           "Foregut 2",
+                                                           "Foregut 1",
+                                                           "Midgut",
+                                                           "Midgut/Hindgut",
+                                                           "Hindgut 2",
+                                                           "Hindgut 1",
+                                                           "ExE endoderm"),
+                                                ordered = TRUE), 
+                                     fill = Var2, 
+                                     y = value)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("DE" = "seagreen4", "VE" = "coral"), name = "") +  
+  theme(axis.text.x = element_text(angle = -30, hjust = 0),
+        axis.title.x = element_blank()) +
+  labs(y = "Number of cells")
+
+p4 = ggplot(mapping = aes(x = late_meta$cluster.name, y = sub_meta$forward_ratio[match(late_meta$cell, sub_meta$cell)])) +
+  geom_violin() +
+  scale_y_log10() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.title.x = element_blank()) +
+  geom_hline(yintercept = 1) +
+  labs(y = "DE mass/VE mass")
+
+plot_grid(p1, p2, p3,p4, labels = "AUTO")
+
+ggsave(p1,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_forward_starting.pdf",
+       width = 6, height = 6)
+
+ggsave(p2,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_forward_result.pdf",
+       width = 6, height = 6)
+
+ggsave(p3,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_forward_barplot.pdf",
+       width = 6, height = 4)
+
+ggsave(outcome_numbers,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_forward_barplot_abs.pdf",
+       width = 6, height = 4)
+
+```
+
+Particularly, note that one hindgut cluster is composed almost entirely of cells that are predicted to derive from the visceral endoderm. These may be the cells described Kwon et al., and we will investigate these in the next section.
+
+## Moving backward through the map
+
+Instead of looking forward through the map, we could look backward from the cells in E8.5 endpoints that we have defined in the embyronic gut, above. These cells are shown in Figure \@ref(fig:pull), excluding the ExE endoderm.
+
+```{r pull, fig.cap = "Endpoints shown on the force-directed layout (A) and by diffusion map (B).", fig.height = 8}
+
+cols = late_clusts[match(sub_meta$cell, late_meta$cell)]
+cols = cluster_labels[match(cols, names(cluster_labels))]
+cols[is.na(cols)] = "Not terminus"
+cols = factor(cols, levels = c(cluster_labels, "Not terminus"), ordered = TRUE)
+order = order(cols, decreasing = TRUE)
+
+late_cols = cluster_colours
+names(late_cols) = cluster_labels[names(cluster_colours)] 
+
+graph_endpoints = ggplot(graph_df[order,], aes(x = gephiX, y= gephiY, col = cols[order])) +
+  geom_point() +
+  scale_colour_manual(values = c(late_cols, "Not terminus" = "darkgrey"), name = "Endpoint") +
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+
+big_meta$terminus = sapply(1:nrow(big_meta), function(x){
+  if(big_meta$stage[x] %in% c("E8.5") & big_meta$celltype[x] %in% c("Gut")){
+    return(late_meta$cluster.name[match(big_meta$cell[x], late_meta$cell)])
+  } else if(big_meta$stage[x] %in% c("E8.5") & big_meta$celltype[x] %in% c("ExE endoderm")){
+    return("ExE endoderm")
+  } else {
+    return("Not terminus")
+  }
+})
+
+pdf = data.frame(DC1 = big_dmap$DC1, DC2 = big_dmap$DC2, terminus = big_meta$terminus)
+
+big_celltype_termini = ggplot(mapping = aes(DC1, DC2, col = terminus)) +
+  geom_point(data = pdf[big_meta$terminus == "Not terminus",]) +
+  geom_point(data = pdf[big_meta$terminus != "Not terminus",]) +
+  scale_colour_manual(values = c(named_cluster_colours, 
+                                 "ExE endoderm" = as.character(celltype_colours["ExE endoderm"]),
+                                 "Not terminus" = "darkgrey"),
+                      name = "Endpoint")+
+  labs(x = "DC1", y = "DC2")  +
+  guides(col = guide_legend(override.aes = list(size = 3)))
+
+plot_grid(graph_endpoints, big_celltype_termini, nrow = 2, labels = "AUTO")
+
+targets = lapply(1:7, function(x){
+  target_cells = late_meta$cell[late_clusts == x & late_meta$stage == "E8.5"]
+  string = paste(cluster_labels[x], cluster_labels[x], paste(target_cells, collapse="\t"), sep = "\t")
+  return(string)
+})
+
+targets[[8]] = paste("ExE endoderm", 
+                     "ExE endoderm", 
+                     paste(big_meta$cell[big_meta$celltype == "ExE endoderm" & 
+                                           big_meta$stage == "E8.5"], collapse="\t"), 
+                     sep = "\t")
+
+comb = do.call(c, targets)
+
+wot_target_loc = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/backward_targets.gmt"
+wot_backward_out = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/wot/backward_output.txt"
+
+write.table(comb, file = wot_target_loc, col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+command = paste("wot trajectory --tmap", wot_out_loc, "--cell_set", wot_target_loc, "--time 8.5 --out", wot_backward_out)
+#this was run separately
+# system(command)
+
+wot_backward = read.table(wot_backward_out, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+ggsave(graph_endpoints,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_backward_endpoints.pdf",
+       width = 6, height = 6)
+
+
+ggsave(big_celltype_termini,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_backward_endpoints_dmap.pdf",
+       width = 7, height = 5)
+
+```
+
+In Figure \@ref(fig:traj-back), we show results for this approach to the map. Specifically, we show the fraction of cells at each timepoint which showed the greatest mass contribution to each of the celltype termini. However, we note that different cells may be called with a different level of confidence. We have a measure of the confidence of our trajectory assignments by considering the ratio of the maximum mass for each cell towards each endpoint (i.e. the one to which it was allocated) by the median mass for each cell across all endpoints. Where most mass derives from one or a few endpoints, the assignment is more likely to be correct; where mass derives from very many endpoints, it is likely that the cell is in an uncommitted state. Notably, the pharyngeal endoderm (to which many DE cells have been assigned) has very low levels of confidence by this measure.
+
+```{r traj-back, fig.height = 12, fig.wide = TRUE, fig.cap = "Results of pulling backward through the transport map. A: The terminal clusters to which cells of different timepoints and stages derive the most mass. B: A measure of confidence of each assignment is shown, for cells of all timepoints assigned to each endpoint with respect to the maximum mass contributed."}
+
+wot_backward$stage = big_meta$stage[match(wot_backward$id, big_meta$cell)]
+wot_backward$celltype = big_meta$celltype[match(wot_backward$id, big_meta$cell)]
+wot_backward$max.mass = sapply(1:nrow(wot_backward), function(x){
+    row = as.numeric(wot_backward[x, 2:9])
+    names(row) = names(wot_backward)[2:9]
+    return(names(which.max(row)))
+})
+wot_backward$max.mass = gsub(".", " ", wot_backward$max.mass, fixed = TRUE)
+wot_backward$max.mass[wot_backward$max.mass == "Midgut Hindgut"] = "Midgut/Hindgut"
+
+wot_backward$confidence = sapply(1:nrow(wot_backward), function(x){
+  row = as.numeric(wot_backward[x, 2:9])
+  # return(max(row)/max(row[-which.max(row)]))
+  return(max(row)/median(row))
+})
+
+wot_backward$hg2.score = sapply(1:nrow(wot_backward), function(x){
+  row = as.numeric(wot_backward[x, 2:9])
+  names(row) = names(wot_backward)[2:9]
+  return(row["Hindgut.2"]/max(row))
+})
+
+
+
+p1 = ggplot(data = wot_backward, mapping = aes(x = stage, fill = max.mass)) + 
+  geom_bar() + 
+  scale_fill_manual(values = c(late_cols, "ExE endoderm" = "grey20"), name = "Max mass") + 
+  facet_wrap(~celltype) +
+  theme(axis.text.x = element_text(angle = 90, hjust= 1, vjust = 0.5),
+        axis.title.x = element_blank())
+
+p2 = ggplot(data = wot_backward, mapping = aes(x = max.mass, y = confidence)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 90, hjust= 1, vjust = 0.5)) +
+  scale_y_log10() +
+  coord_cartesian(ylim = c(1, 10)) +
+  labs(x = "Trajectory assignment", y = "Max mass/Median mass")
+
+plot_grid(p1, p2, nrow = 2, labels = "AUTO")
+
+```
+
+The assignments made according to maximum mass are shown in Figure \@ref(fig:graph-backward) on the force-directed layout.
+
+```{r graph-backward, warning = FALSE}
+
+graph_backwards = ggplot(graph_df, aes(x = gephiX, y= gephiY, col = wot_backward$max.mass[match(sub_meta$cell, wot_backward$id)])) +
+  geom_point() +
+  scale_colour_manual(values = c(late_cols, "ExE endoderm" = "grey20"), name = "Max mass") +
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+graph_backwards
+
+```
+
+We will return to classification of these trajectories in the final part of our analyses in this document.
+
+#Extraembryonic contribution to the embryonic gut
+
+##Differences in the hindgut
+
+We note that the Hindgut 1 cluster appears to receive large contributions from the visceral endoderm in our transport map analyses, whereas Hindgut 2 does not.
+
+What differentates these two groups of cells? We perform differential expression analysis, with results shown in Figure \@ref(fig:hind-de). We tested for differential against an logFC threshold of ±0.5 (as in [TREAT](https://academic.oup.com/bioinformatics/article/25/6/765/251641)).
+
+```{r hind-de, fig.cap = "Volcano plot of diffiential expression in the two terminal hindgut clusters. Genes on the right of the plot are more highly expressed in the embryonic derived hindgut. Genes highlighted in red passed significance testing (FDR-adjusted p < 0.1). Genes with a minimum mean normalised count of 0.1 across both clusters were considered for DE analysis. The four labelled genes are mentioned below."}
+
+combs = combn(names(cluster_labels), 2)
+combs_name= matrix(cluster_labels[combs], nrow = 2, byrow=FALSE)
+
+do_de = function(clust1, clust2){
+  wee_sce = scater::normalize(late_sce[,late_clusts %in% c(clust1, clust2)])
+  wee_meta = late_meta[late_clusts %in% c(clust1, clust2),]
+  avg = calcAverage(wee_sce)
+  
+  de = findMarkers(wee_sce,
+                   clusters = late_clusts[late_clusts %in% c(clust1, clust2)],
+                   block = factor(wee_meta$sample),
+                   full.stats = TRUE,
+                   lfc = 0.5)
+  de = de[[1]][[4]]
+
+  de = de[rownames(de) %in% names(avg[avg > 0.1]),]
+  de$p.value = exp(de$log.p.value)
+  de$FDR = p.adjust(de$p.value, method = "fdr")
+  de$mgi = genes[match(rownames(de), genes[,1]),2]
+  
+  return(de)
+  
+}
+
+des = apply(combs, 2, function(x) do_de(x[1], x[2]))
+
+# # fracde = sapply(des, function(x) sum(x$FDR < 0.1)/nrow(x))
+# nde = sapply(des, function(x) sum(x$FDR < 0.1))
+# # nfc = sapply(des, function(x) sum(x$logFC > 0.5 | x$logFC < -0.5))
+# 
+# df = data.frame(c1 = combs[1,], c2 = combs[2,], nde = nde)
+# 
+# df$hg1 = ifelse(df$c1 == 7 | df$c2 == 7, TRUE, FALSE)
+# 
+# ggplot(df, aes(x = hg1, y = df$nde, col = hg1)) +
+#   geom_violin()
+# 
+# tab = acast(data = df, formula = c1 ~ c2, value.var = "nde")
+# tab = cbind(rep(NA, 6),tab)
+# tab = rbind(tab, rep(NA, 7))
+# colnames(tab)[1] = 1
+# rownames(tab)[nrow(tab)] = 7
+# diag(tab) = 0
+# 
+# colnames(tab) = cluster_labels[as.character(colnames(tab))]
+# rownames(tab) = cluster_labels[as.character(rownames(tab))]
+# 
+# pheatmap(tab)
+
+hind_de = des[[which(apply(combs, 2, function(x) all(c(7,5) %in% x)))]]
+fore_de = des[[which(apply(combs, 2, function(x) all(c(1,3) %in% x)))]]
+
+hits = c(as.character(hind_de$mgi[hind_de$logFC > 0][1:5]),
+         as.character(hind_de$mgi[hind_de$logFC < 0][1:5]))
+
+labs = hind_de[hind_de$mgi %in% hits,]
+
+de_hg = ggplot(as.data.frame(hind_de), aes(x = logFC, y = -log10(p.value), col = FDR < 0.1 , 
+                                           size = as.character((FDR < 0.1) + (mgi %in% labs$mgi)))) +
+  geom_point() +
+  scale_colour_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  scale_size_manual(values = c("1" = 1, "0" = 0.2, "2" = 2)) +
+  labs(x = "logFC (Hindgut 1/Hindgut 2)", y = "-log10(p)") +
+  geom_text_repel(data = as.data.frame(labs),
+           mapping = aes(x = logFC, y= -log10(p.value), label = mgi),
+           nudge_y = 1.5,
+           nudge_x = 0.1,
+           inherit.aes = FALSE) +
+  theme(legend.position = "none")
+
+de_hg
+
+ggsave(de_hg,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/hindgut_ve_volcano.pdf",
+       width = 6, height = 6)
+
+de_fg = ggplot(as.data.frame(fore_de), aes(x = logFC, y = -log10(p.value), col = FDR < 0.1 , 
+                                           size = as.character((FDR < 0.1) + (mgi %in% labs$mgi)))) +
+  geom_point() +
+  scale_colour_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  scale_size_manual(values = c("1" = 1, "0" = 0.2, "2" = 2)) +
+  labs(x = "logFC (Foregut 2/Foregut 1)", y = "-log10(p)") +
+
+  theme(legend.position = "none")
+
+
+# genes_ve = rownames(hind_de)[hind_de$FDR < 0.1 & hind_de$logFC < 0]
+# enrich_ve = enrich_genes_goana(genes_ve, rownames(hind_de), warn_missing = FALSE)$result
+# 
+# genes_de = rownames(hind_de)[hind_de$FDR < 0.1 & hind_de$logFC > 0]
+# enrich_de = enrich_genes_goana(genes_de, rownames(hind_de), warn_missing = FALSE)$result
+
+# 
+# x <- counts(hind_sce[calcAverage(hind_sce) > 1,])
+# group <- factor(late_clusts[late_clusts %in% c(5,7)])
+# y <- DGEList(counts=x,group=group)
+# y <- calcNormFactors(y)
+# design <- model.matrix(~group)
+# y <- estimateDisp(y,design)
+# 
+#  
+# fit <- glmFit(y,design)
+# lrt <- glmLRT(fit,coef=2)
+# out = lrt$table
+# out$mgi = genes[match(rownames(out), genes[,1]), 2]
+# out = out[order(out$PValue),]
+# out$fdr = p.adjust(out$PValue, method = "fdr")
+# 
+# 
+# out = glmTreat(fit)
+# 
+# v = voom(y, design)
+# fit <- lmFit(v, design)
+# fit <- eBayes(fit)
+# topTable(fit, coef=ncol(design))
+# padj = p.adjust(fit$p.value[,2], method = "fdr")
+```
+
+By comparison, the DE between the two foregut clusters is also shown in Figure \@ref(fig:de-compare).
+
+```{r de-compare, fig.wide = TRUE, fig.cap = "DE between the Foregut and Hindgut clusters."}
+lims = lims(x = c(min(c(fore_de$logFC, hind_de$logFC)),
+                  max(c(fore_de$logFC, hind_de$logFC))),
+            y = c(0, max(c(-log10(fore_de$p.value),
+                           -log10(hind_de$p.value)))))
+grid = plot_grid(de_hg + lims, 
+          de_fg + lims)
+
+grid
+
+```
+
+The two genes that are by far most highly differentially expressed genes are X-linked (*Trap1a* and *Rhox5*, as has been mentioned in [this preprint](https://www.biorxiv.org/content/early/2018/08/03/384925)). However, this does not correspond to a wider trend across X-linked genes: these is shown in Figure \@ref(fig:hind-xchr).
+
+```{r hind-xchr, fig.cap = "Fold changes for X-linked genes are shown. There is no systematic deviation of the fold changes from 0."}
+
+mouse_ensembl = useMart("ensembl")
+mouse_ensembl = useDataset("mmusculus_gene_ensembl", mart = mouse_ensembl)
+gene_map = getBM(attributes=c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = rownames(late_sce), mart = mouse_ensembl)
+xchr = gene_map[gene_map[,2] == "X", 1]
+
+ggplot(mapping = aes(x = hind_de$logFC[rownames(hind_de) %in% xchr])) +
+  geom_histogram(bins = 20) +
+  labs(x = "logFC (Hindgut 2/Hindgut 1)", y = "Count")
+
+```
+
+The expression patterns of these genes are shown in the full dataset in Figure \@ref(fig:ve-genes).
+
+```{r ve-genes, fig.wide = TRUE, fig.height = 8, fig.cap = "Rhox5 and Trap1a expression across the atlas dataset."}
+
+p_rhox = plot_expr(coord_1 = umap[,1],coord_2 = umap[,2], gene_name = "Rhox5", labels = c("UMAP1", "UMAP2"), sce = sce)
+p_trap = plot_expr(coord_1 = umap[,1],coord_2 = umap[,2], gene_name = "Trap1a", labels = c("UMAP1", "UMAP2"), sce = sce)
+p_celltype = ggplot(as.data.frame(umap), aes(x = V1, y = V2, col = factor(meta$celltype, levels = names(celltype_colours), ordered = TRUE))) +
+  geom_point(size = 0.4) +
+  labs(x = "UMAP1", y = "UMAP2") +
+  scale_color_manual(values = celltype_colours, name = "Celltypes") +
+  guides(colour = guide_legend(override.aes = list(size=4))) 
+
+plot_grid(plot_grid(p_rhox, p_trap, nrow = 1),
+          p_celltype,
+          ncol = 1)
+
+```
+
+Interestingly, two other DE genes were *Cdx1* and *Cdx4*. The expression pattern across the gut is shown in Figure \@ref(fig:cdx).
+
+```{r cdx, fig.cap = "Cdx1 and Cdx4 expression in the gut."}
+
+p1 = gut_plot("Cdx1")
+p2 = gut_plot("Cdx4")
+
+plot_grid(p1, p2, ncol =1)
+```
+
+
+##Contribution to other gut tissues
+
+Given the strong differential expression of *Rhox5* and *Trap1a*, and their expression in other extraembryonic tissues, how are these genes distributed in the gut? This is shown in Figure \@ref(fig:rhox).
+
+```{r rhox, fig.cap = "Rhox5 and Trap1a expression in the mature gut cells."}
+
+p1 = gut_plot("Rhox5")
+
+p2 = gut_plot("Trap1a")
+
+plot_grid(p1, p2, nrow = 2)
+
+```
+
+What fraction of cells in each of the mature gut clusters express either of these genes? This is shown in Figure \@ref(fig:exe)
+
+```{r exe, fig.cap = "The fraction of cells expressing either Trap1a or Rhox5 is shown for each cluster of the embryonic gut."}
+
+rhox = as.numeric(logcounts(late_sce[match("Rhox5", genes[,2]),]))
+trap = as.numeric(logcounts(late_sce[match("Trap1a", genes[,2]),]))
+either = rhox | trap
+
+tab = table(late_clusts, either)
+tab = sweep(tab, 1, rowSums(tab), "/")
+rownames(tab) = cluster_labels[match(rownames(tab), names(cluster_labels))]
+mlt = melt(tab)
+
+exe_mark = ggplot(mlt, aes(x = late_clusts, y = value, fill = either)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(labels = c("TRUE" = "Trap1a+ or Rhox5+", "FALSE" = "Trap1a- & Rhox5-"), values= c("TRUE" = "coral", "FALSE" = "seagreen4"), name = "") +
+  labs(y = "Fraction of cells") +
+  theme(axis.text.x = element_text(angle = -25, hjust = 0),
+        axis.title.x = element_blank())
+
+exe_mark
+
+ggsave(exe_mark,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/trap_rox_expr.pdf",
+       width = 6, height = 6)
+
+```
+
+Assuming that these genes mark visceral endoderm contribution, there appear to be VE-derived cells present in all gut lineages.
+
+To generalise our DE comparisons across all these tissues, we have performed a differential expression analysis between gut cells at the E8.25 and E8.5 timepoints that express either of those genes and cells from the same timepoints and tissues that do not. Additionally, the assigned cluster for each cell (e.g., "Foregut 1") was included as a blocking factor, to avoid effects of compositional differences, and DE was tested against a logFC threshold of 0.5. This procedure should test for systematic differences in the expression profiles of Rhox5 or Trap1a positive cells compared to the negative cells irrespective of the region of the gut to which they contribute. Interestingly, few other genes appear to differ (Figure \@ref(fig:de-exe)).
+
+```{r de-exe, fig.cap = "Differential expression volcano plot between cells that do or do not express Rhox5 or Trap1a, at E8.25 and E8.5."}
+
+rt = calcAverage(late_sce) > 1
+markers = findMarkers(late_sce[rt,], clusters = as.numeric(either), block = late_clusts, full.stats = TRUE, lfc = 0.5)
+markers$`0`$mgi = genes[match(rownames(markers$`0`), genes[,1]),2]
+
+de_exe = markers$`0`$stats.1
+de_exe$FDR = exp(de_exe$log.FDR)
+de_exe$mgi = markers$`0`$mgi
+labs = de_exe[de_exe$FDR < 0.1,]
+
+
+
+
+ggplot(as.data.frame(de_exe), aes(x = logFC, y = -log10(exp(log.p.value)), col = FDR < 0.1, size = FDR < 0.1)) +
+  geom_point() +
+  scale_colour_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  scale_size_manual(values = c("TRUE" = 1, "FALSE" = 0.2)) +
+  labs(x = "logFC (Midgut/Foregut 2)", y = "-log10(p)") +
+  geom_label(data = as.data.frame(labs),
+           mapping = aes(x = logFC, y= -log10(exp(log.p.value)), label = mgi),
+           nudge_y = 1.5,
+           inherit.aes = FALSE) +
+  theme(legend.position = "none")
+
+```
+
+## Position of visceral endoderm-derived gut
+
+Interestingly, the Hindgut 1 cluster was positioned at the most hindward position of our spatial ordering of the gut tube (Figure \@ref(fig:hindward-ve)). 
+
+```{r hindward-ve, fig.cap = "Density of celltypes along the pseudospatial ordering of gut cells."}
+
+gut_density
+
+```
+
+In order to validate both this suggestion of hindward-ness, and the presence of VE-derived cells concentrated in the hindgut, we dissected a *Ttr::Cre* lineage traced mouse at E8.5, exposing the embryonic gut. *Ttr* is very highly expressed in the visceral endoderm, and such cells and their descendants become fluorescently labelled. An image from the dissection is shown in Figure \@ref(fig:dissection). Note that lineage traced cells are visible at a low level across the length of the gut tube, and moreover are very highly concentrated at the most rearward section of the embryo.
+
+```{r dissection, fig.cap = "Dissection of a *Ttr-Cre* lineage traced mouse at E8.5, exposing the embryonic gut. Red fluorescence is phalloidin, green fluorescence is *YFP* that is expressed in *Ttr* expressing cells and their progeny.", out.height = 10}
+
+knitr::include_graphics(paste0("/nfs/research1/marioni/jonny/embryos/scripts/endoderm/gut_microscopy.png"))
+
+```
+
+#Gene dynamics in the formation of the Hindgut
+
+We have observed that many cells from the visceral endoderm appear to contribute to the hindgut of the developing mouse, which is supported by other linage-tracing experiments. How do these cells mature from their respective origins?
+
+To define these trajectories, we use the masses calculated when we pulled backward through the transport maps. Specifically:
+
+* For the visceral endoderm to Hindgut 1 trajectory, we consider cells with largest mass contribution to Hindgut 1. These cells are all classified in the celltype visceral endoderm.
+
+* For the definitive endoderm to Hindgut 2 trajectory, we include cells with largest mass contribution to Hindgut 2 which are of the celltypes gut or definitive endoderm (i.e. excluding visceral endoderm). However, these cells do not extend into the definitive endoderm, where we observe roughly similar mass contributions to various terminal celltypes (Figure \@ref(fig:traj-back)B). We therefore also include cells for which the Hindgut 2 mass contribution is >90% the contribution of the celltype terminus with largest contribution, assuming that these cells represent common progenitors.
+
+The cells allocated to each trajectory are shown in Figure \@ref(fig:show-hg-traj)
+
+```{r show-hg-traj, fig.cap = "Cells included in trajectories from origin cells to hindgut."}
+
+cells_hg1 = wot_backward$id[wot_backward$max.mass == "Hindgut 1"]
+cells_hg2 = wot_backward$id[wot_backward$hg2.score > 0.9 &
+                              wot_backward$celltype %in% c("Def. endoderm",
+                                                           "Gut")]
+
+col = sapply(sub_meta$cell, function(x){
+  if(x %in% cells_hg1){
+    return("Hindgut 1")
+  } else if(x %in% cells_hg2){
+    return("Hindgut 2")
+  } else {
+    return("Neither")
+  }})
+
+
+ord = order(col, decreasing = TRUE)
+
+traj_wot = ggplot(mapping = aes(x = graph_df$gephiX[ord], y = graph_df$gephiY[ord], col = col[ord])) +
+  geom_point(size = 1) +
+  scale_color_manual(values = c("Hindgut 1" = "coral", "Hindgut 2" = "seagreen4", "Neither" = "darkgrey"), name = "") +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank()) +
+  labs(x = "gephiX", y = "gephiY")
+
+traj_wot
+
+ggsave(traj_wot,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/wot_backward_trajectories.pdf",
+       width = 6, height = 6)
+
+```
+
+##Identifying cell orderings with DPT
+
+We take these cells and compute diffusion maps using subsetted batch-corrected PCs.
+
+```{r getdpt}
+
+hg1_sce = scater::normalize(sub_sce[, sub_meta$cell %in% cells_hg1])
+hg1_meta = sub_meta[sub_meta$cell %in% cells_hg1,]
+
+set.seed(42)
+hg1_dmap = DiffusionMap(corrected[match(hg1_meta$cell, rownames(corrected)),])
+
+hg2_sce = scater::normalize(sub_sce[,sub_meta$cell %in% cells_hg2])
+hg2_meta = sub_meta[sub_meta$cell %in% cells_hg2,]
+
+set.seed(42)
+hg2_dmap = DiffusionMap(corrected[match(hg2_meta$cell, rownames(corrected)),])
+
+```
+
+Expression of of the genes *Ttr* and *Cdx2* in the cells of the Hindgut 1 trajectory is shown in Figure \@ref(fig:plot-hg1-genes). These mark the visceral endoderm (start) and hindgut (end) of the trajectory - we compute DPT from the cell with maxmum value of DC1 in this plot. The diffusion map was calculated from the Hindgut 1 trajectory subset of the batch-corrected PCA coordinates calculated for the endoderm cells. Also shown is the stage from which cells derived, and the DPT value assigned.
+
+```{r plot-hg1-genes, fig.wide = TRUE, fig.height = 8, fig.cap = "Hindgut 1 trajectory cell summary"}
+
+hg1_dpt = DPT(hg1_dmap)[[paste0("DPT", which.max(hg1_dmap$DC1))]]
+
+ro = sample(nrow(hg1_meta), nrow(hg1_meta))
+hg1_ttr = plot_expr(hg1_dmap$DC1, hg1_dmap$DC2, "Ttr", sce = hg1_sce)
+hg1_cdx = plot_expr(hg1_dmap$DC1, hg1_dmap$DC2, "Cdx2", sce = hg1_sce)
+hg1_stage = ggplot(mapping = aes(x = hg1_dmap$DC1[ro], y= hg1_dmap$DC2[ro], col = hg1_meta$stage[ro])) +
+  geom_point() +
+  scale_color_manual(values = stage_colours, labels = stage_labels, name = "") +
+  labs(x = "DC1", y = "DC2")
+
+hg1_dptcol = ggplot(mapping = aes(x = hg1_dmap$DC1[ro], y= hg1_dmap$DC2[ro], col = hg1_dpt[ro])) +
+  geom_point() +
+  scale_color_viridis_c(name = "DPT") +
+  labs(x = "DC1", y = "DC2")
+
+plot_grid(hg1_ttr, hg1_cdx, hg1_stage, hg1_dptcol)
+
+```
+
+The correspondance of DPT to cell timepoints is shown in Figure \@ref(fig:dpt-hg1).
+
+```{r dpt-hg1, fig.cap = "DPT correlates with cell capture times."}
+
+
+hg1_meta$dpt = hg1_dpt
+
+
+p1 = ggplot(hg1_meta, aes(x = stage, col = stage, y = dpt)) +
+  geom_jitter(height = 0, width = 0.3) +
+  scale_color_manual(values = stage_colours, labels = stage_labels) +
+  scale_x_discrete(labels = stage_labels) +
+  coord_flip() +
+  labs(y = "DPT") +
+  theme(axis.title.y = element_blank(),
+        legend.position = "none")
+p1
+
+ggsave(p1,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/hg1_stage_dpt_points.pdf",
+       width = 4, height = 6)
+
+```
+
+Similarly for the Hindgut 2 trajectory, a diffusion map embedding with the genes *Pou5f1* and *Cdx4* in the Hindgut 1 trajectory is shown in Figure \@ref(fig:plot-hg2-genes). These mark the primitive streak (start) and hindgut (end) of the trajectory - we compute DPT from the cell with minimum value of DC1 in this plot. DPT was calculated as for the hindgut 1 trajectory. Also shown is the stage from which cells derived, and the DPT value assigned.
+
+```{r plot-hg2-genes, fig.wide = TRUE, fig.height = 8, fig.cap = "Hindgut 1 trajectory cell summary"}
+
+ro = sample(nrow(hg2_meta), nrow(hg2_meta))
+
+hg2_pou = plot_expr(hg2_dmap$DC1, hg2_dmap$DC2, "Pou5f1", sce = hg2_sce)
+hg2_cdx = plot_expr(hg2_dmap$DC1, hg2_dmap$DC2, "Cdx4", sce = hg2_sce)
+
+hg2_dpt = DPT(hg2_dmap)[[paste0("DPT", which.min(hg2_dmap$DC1))]]
+
+
+hg2_stage = ggplot(mapping = aes(x = hg2_dmap$DC1[ro], y= hg2_dmap$DC2[ro], col = hg2_meta$stage[ro])) +
+  geom_point() +
+  scale_color_manual(values = stage_colours, labels = stage_labels, name = "") +
+  labs(x = "DC1", y = "DC2")
+
+hg2_dptcol = ggplot(mapping = aes(x = hg2_dmap$DC1[ro], y= hg2_dmap$DC2[ro], col = hg2_dpt[ro])) +
+  geom_point() +
+  scale_color_viridis_c(name = "DPT") +
+  labs(x = "DC1", y = "DC2")
+
+plot_grid(hg2_pou, hg2_cdx, hg2_stage, hg2_dptcol)
+
+```
+
+The correspondance of DPT to cell timepoints is shown in Figure \@ref(fig:dpt-hg2).
+
+```{r dpt-hg2, fig.cap = "DPT correlates with cell capture times"}
+
+
+hg2_meta$dpt = hg2_dpt
+
+
+p1 = ggplot(hg2_meta, aes(x = stage, col = stage, y = dpt)) +
+  geom_jitter(height = 0, width = 0.3) +
+  scale_colour_manual(values = stage_colours, labels = stage_labels) +
+  scale_x_discrete(labels = stage_labels) +
+  coord_flip() +
+  labs(y = "DPT") +
+  theme(axis.title.y = element_blank(),
+        legend.position = "none")
+
+p1
+
+ggsave(p1,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/hg2_stage_dpt_points.pdf",
+       width = 4, height = 6)
+
+```
+
+
+##Identifying gene clusters
+
+We now apply our clustering approach (described above, *Spatial gene expression dynamics of the gut tube*) to these cells along their pseudotime trajectories.
+
+Summaries of the identified gene clusters are shown in Figure \@ref(fig:clustering) (for the VE to hindgut trajectory) and Figure \@ref(fig:clustering-hg2) (for the streak to hindgut trajectory).
+
+
+```{r clustering, fig.cap = "Summaries of the detected gene clusters for the hindgut 1 trajectory are shown. The black line indicated the mean value across genes for every observed DC1 coordinate; grey shading indicates the standard deviation at each value."}
+
+hg1_hvgs = getHVGs(hg1_sce)
+hg2_hvgs = getHVGs(hg2_sce)
+
+clusters_hg1 = get_gene_clusters(hg1_sce[hg1_hvgs,], 
+                                 hg1_dpt, 
+                                 seed = 42, 
+                                 predict_even = TRUE, 
+                                 normalise = TRUE,
+                                 model_mode = "loess")
+
+clusters_hg2 = get_gene_clusters(hg2_sce[hg2_hvgs,], 
+                                 hg2_dpt, 
+                                 seed = 42, 
+                                 predict_even = TRUE, 
+                                 normalise = TRUE,
+                                 model_mode = "loess")
+
+hg1_plot = plot_cluster_averages(clusters_hg1, predict_even = TRUE)
+
+hg1_plot
+
+ggsave(hg1_plot,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/hg1_clusters.pdf",
+       width = 8, height = 8)
+
+```
+
+```{r clustering-hg2, fig.cap = "Summaries of the detected gene clusters for the hindgut 2 trajectory are shown. The black line indicated the mean value across genes for every observed DC1 coordinate; grey shading indicates the standard deviation at each value."}
+
+hg2_plot = plot_cluster_averages(clusters_hg2, predict_even = TRUE)
+
+hg2_plot
+
+ggsave(hg2_plot,
+       file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/plots/hg2_clusters.pdf",
+       width = 8, height = 8)
+
+clusterdf = data.frame(trajectory = c(rep("VE-HG1", length(clusters_hg1$clusters)),
+                                      rep("DE-HG2", length(clusters_hg2$clusters))),
+                       ensembl = c(names(clusters_hg1$clusters),
+                                   names(clusters_hg2$clusters)),
+                       cluster = c(clusters_hg1$clusters,
+                                   clusters_hg2$clusters))
+
+clusterdf$mgi = genes[match(clusterdf$ensembl, genes[,1]),2]
+
+write.table(clusterdf, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/gene_clustering_trajectories.csv", sep = ",", col.names = TRUE, row.names = FALSE, quote = FALSE)
+                       
+
+```
+
+## Inspection of specific genes
+
+To confirm that the trajectories that we have identified make sense, we incpect the expression patterns of several individual genes. First, in Figure \@ref(fig:exe-check), we show the expression of *Rhox5* and *Trap1a* along the two trajectories described above. Particularly, note that there remains low to no expression of these genes along the entire length of the Hindgut 2 trajectory, suggesting that at no point does it contain a large number of extraembryonic-derived cells.
+
+```{r exe-check, fig.wide = TRUE, fig.height= 8, fig.cap = "Trap1a and Rhox5 expression is high along the Hindgut 1 trajectory, while remaining low across the Hindgut 2 trajectory.", warning = FALSE}
+
+expr_rhox_1 = as.numeric(logcounts(sub_sce[match("Rhox5", genes[,2]), sub_meta$cell %in% cells_hg1]))
+
+p1 = ggplot(mapping = aes(x = clusters_hg1$dpt, y = expr_rhox_1)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, col = "darkgrey") +
+  labs(x = "DPT", y = "Rhox5 expression") +
+  ggtitle("Hindgut 1 trajectory") +
+  lims(y = c(0,6))
+
+
+expr_rhox_2 = as.numeric(logcounts(sub_sce[match("Rhox5", genes[,2]), sub_meta$cell %in% cells_hg2]))
+
+p2 = ggplot(mapping = aes(x = clusters_hg2$dpt, y = expr_rhox_2)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, col = "darkgrey") +
+  labs(x = "DPT", y = "Rhox5 expression") +
+  ggtitle("Hindgut 2 trajectory") +
+  lims(y = c(0,6))
+
+expr_trap_1 = as.numeric(logcounts(sub_sce[match("Trap1a", genes[,2]), sub_meta$cell %in% cells_hg1]))
+
+p3 = ggplot(mapping = aes(x = clusters_hg1$dpt, y = expr_trap_1)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, col = "darkgrey") +
+  labs(x = "DPT", y = "Trap1a expression") +
+  ggtitle("Hindgut 1 trajectory") +
+  lims(y = c(0,6))
+
+
+expr_trap_2 = as.numeric(logcounts(sub_sce[match("Trap1a", genes[,2]), sub_meta$cell %in% cells_hg2]))
+
+p4 = ggplot(mapping = aes(x = clusters_hg2$dpt, y = expr_trap_2)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ x, col = "darkgrey") +
+  labs(x = "DPT", y = "Trap1a expression") +
+  ggtitle("Hindgut 2 trajectory") +
+  lims(y = c(0,6))
+
+
+
+plot_grid(p1, p2, p3, p4)
+
+```
+
+We also show the expression of Y-chromosomal genes in Figure \@ref(fig:ygenes-test) to show that trajectories are not driven by sex differences.
+
+```{r ygenes-test, fig.cap = "There is no notable difference in Y-chromosome gene expression between the two trajectories", warning= FALSE}
+
+ygenes = gene_map$ensembl_gene_id[gene_map$chromosome_name == "Y"]
+
+yexpr = counts(sub_sce[ygenes, sub_meta$cell %in% cells_hg1])
+ytot1 = Matrix::colSums(yexpr) / sizeFactors(sub_sce[,sub_meta$cell %in% cells_hg1])
+ytot1 = log2(ytot1 + 1)
+
+p1 = ggplot(mapping = aes(x = clusters_hg1$dpt, y = ytot1)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ x, col = "darkgrey") +
+  labs(x = "DPT", y = "YCHR log counts") +
+  ggtitle("Hindgut 1 trajectory") +
+  lims(y = c(0,4))
+
+
+yexpr = counts(sub_sce[ygenes, sub_meta$cell %in% cells_hg2])
+ytot2 = Matrix::colSums(yexpr) / sizeFactors(sub_sce[,sub_meta$cell %in% cells_hg2])
+ytot2 = log2(ytot2 + 1)
+
+p2 = ggplot(mapping = aes(x = clusters_hg2$dpt, y = ytot2)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ x, col = "darkgrey") +
+  labs(x = "DPT", y = "YCHR log counts") +
+  ggtitle("Hindgut 2 trajectory") +
+  lims(y = c(0,4))
+
+plot_grid(p1, p2)
+```
+
+##Recording GO enrichments
+
+We calculate GO enrichments for the genes in these clusters using `limma::goana`. The background gene list is the set of expressed genes (mean normalised count >0.1) in each of the Hindgut 1 and Hindgut 2 trajectories.
+
+```{r go-hits, message = FALSE}
+ca = calcAverage(hg1_sce)
+hg1_genes = names(ca)[ca > 0.1]
+enrich_hg1 = lapply(unique(clusters_hg1$clusters), function(x){
+  enrich = enrich_genes_goana(hits = names(clusters_hg1$clusters)[clusters_hg1$clusters == x],
+                              # universe = names(clusters_hg1$clusters),
+                              universe = hg1_genes,
+                              warn_missing = FALSE)$result
+  enrich= enrich[enrich$Ont == "BP", ]
+  enrich$FDR = p.adjust(enrich$P.DE, method = "fdr")
+  enrich$cluster = x
+  return(enrich)
+})
+
+enrich_hg1 = do.call(rbind, enrich_hg1)
+
+ca = calcAverage(hg2_sce)
+hg2_genes = names(ca)[ca > 0.1]
+
+enrich_hg2 = lapply(unique(clusters_hg2$clusters), function(x){
+  enrich = enrich_genes_goana(hits = names(clusters_hg2$clusters)[clusters_hg2$clusters == x],
+                              # universe = names(clusters_hg2$clusters),
+                              universe = hg2_genes,
+                              warn_missing = FALSE)$result
+  enrich= enrich[enrich$Ont == "BP", ]
+  enrich$FDR = p.adjust(enrich$P.DE, method = "fdr")
+  enrich$cluster = x
+  return(enrich)
+})
+
+enrich_hg2 = do.call(rbind, enrich_hg2)
+
+write.table(enrich_hg1, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/hg1_enrichments.csv",
+            sep = ",", quote = FALSE, col.names = TRUE, row.names = TRUE)
+
+write.table(enrich_hg2, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/hg2_enrichments.csv",
+            sep = ",", quote = FALSE, col.names = TRUE, row.names = TRUE)
+
+
+```
+
+# Save data for Shiny
+
+```{r shiny}
+
+endo_meta = sub_meta[,c("cell", "stage", "celltype")]
+#graph vis
+endo_meta$gephiX = graph_df$gephiX
+endo_meta$gephiY = graph_df$gephiY
+#gut clusters
+endo_meta$cluster_gut = late_meta$cluster.name[match(endo_meta$cell, late_meta$cell)]
+endo_meta$gutX = late_dmap$DC1[match(endo_meta$cell, late_meta$cell)]
+endo_meta$gutY = late_dmap$DC2[match(endo_meta$cell, late_meta$cell)]
+#Gut spatial
+endo_meta$gutDPT = gut_dpt[match(endo_meta$cell, gut_meta$cell)]
+#Hindgut trajectories
+endo_meta$trajectory = sapply(endo_meta$cell, function(x){
+  if(x %in% cells_hg1){
+    return("VE")
+  } else if (x %in% cells_hg2){
+    return("DE")
+  } else {
+    return(NA)
+  }
+})
+endo_meta$traj_dpt = sapply(endo_meta$cell, function(x){
+  if(x %in% cells_hg1){
+    return(hg1_dpt[match(x, hg1_meta$cell)])
+  } else if (x %in% cells_hg2){
+    return(hg2_dpt[match(x, hg2_meta$cell)])
+  } else {
+    return(NA)
+  }
+})
+
+saveRDS(endo_meta, file = "/nfs/research1/marioni/jonny/embryos/scripts/endoderm/endo_meta.rds")
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```

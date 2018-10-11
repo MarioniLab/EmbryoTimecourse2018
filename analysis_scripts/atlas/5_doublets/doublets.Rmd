@@ -1,0 +1,624 @@
+---
+title: "Doublet detection and stripped nuclei removal"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+---
+#Introduction
+
+This script detects and removes doublets and stripped nuclei from our dataset. For the doublets, we use a method similar to that developed by the Klein lab and implemented in [Dahlin et al.](http://www.bloodjournal.org/content/131/21/e1.long?sso-checked=true) (and now available separately on [bioRxiv](https://www.biorxiv.org/content/early/2018/07/09/357368)) for detecting doublets. In short, we simulate doublets from our dataset to identify groups of cells that resemble the simulations, and are therefore likely doublets themselves.
+
+We also observe clusters of cells with low numbers of UMIs, and low fractions of UMIs from the mitochondrial genome. We hypothesise that these are nuclei that have lost their cytoplasm, but still been encapsulated into droplets. We remove these cells from our sample due to the technically-derived differences that this "stripping" induces.
+
+```{r load-data, message = FALSE}
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data()
+
+library(irlba)
+library(Rtsne)
+library(ggplot2)
+library(biomaRt)
+library(BiocParallel)
+ncores = 4
+mcparam = MulticoreParam(workers = ncores)
+register(mcparam)
+library(Matrix)
+library(matrixStats)
+library(igraph)
+library(scater)
+library(reshape2)
+library(knitr)
+
+```
+
+#Doublets 
+##Computing doublet scores
+
+Specifically, we use the `doubletCells` method in *scran* to score cells for doublet calling. This works in two steps: first simulating doublets, then by estimating the densities of simulated doublets and observed cells across the gene expression space.
+
+To simulate doublets, random pairs of cells are selected. The count vectors for each of these cells are added together, to form a transcriptional profile for the new simulated doublet. This is then normalised by the sum of the two size factors of each of the original cells (i.e. as if it were normalised "with" the observed data). This process is repeated many times, and the normalised doublet profiles are projected into a principal component space that is calculated from the log-counts of the observed cells only.
+
+Once the cells are projected, the density of doublets and observed cells are estimated at each observed cell's position using a tricube weighted kernel. The per-cell doublet score is the ratio of the doublet density by the observed cell density. This process is carried out considering only highly variable genes (which were calculated per-sample using `trendVar` and `decomposeVar`, selecting cells with adjusted $p<0.05$).
+
+
+```{r computescores, message = FALSE, warning = FALSE}
+
+sub_sces = lapply(unique(meta$sample), function(x) return(scater::normalize(sce[, meta$sample == x])))
+
+hvg.list = lapply(sub_sces, getHVGs)
+names(hvg.list) = unique(meta$sample)
+set.seed(42)
+scores_hvgs = lapply(1:length(sub_sces), function(i) doubletCells(sub_sces[[i]],
+                                                                  approximate = TRUE,
+                                                                  subset.row = rownames(sub_sces[[i]]) %in% hvg.list[[i]]))
+scores_hvgs = do.call(c, scores_hvgs)
+
+scores = scores_hvgs
+
+```
+
+## Scoring of cells
+
+The distributions of doublet scores, split by each sample, are shown in Figure \@ref(fig:samp).
+
+```{r samp, fig.height=6, fig.wide = TRUE, fig.cap = "Distributions of doublet scores, plotted by sample. Samples are ordered from smallest to largest"}
+
+sampsize = melt(table(meta$sample))
+order = order(sampsize$value, decreasing = FALSE)
+
+
+ggplot(data.frame(score = log2(scores+1), sample = meta$sample, stage = meta$stage), aes (x = factor(sample, levels = sampsize$Var1[order]), y = score, fill = stage)) +
+  geom_boxplot(col = "black") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +
+  labs(y = "log2(doublet score + 1)", x = "Sample") +
+  scale_fill_manual(values = stage_colours, labels = stage_labels, name = "Stage")
+
+```
+
+As we consider the larger samples, we see a greater number of outlying scores - consistent with an increased prevalence of doublets in a larger sample. Doublet scores are next shown overlaid on t-SNEs in Figure \@ref(fig:score-tsne).
+
+```{r score-tsne, fig.wide = TRUE, fig.height = 8, fig.cap="Sample-wise t-SNEs are coloured by doublet score. Dark shading indicates higher score; all plots are shaded according to the same range of colour mapping."}
+
+
+tsnes = lapply(unique(meta$sample), function(x){
+  sub = scater::normalize(sce[, meta$sample == x])
+  hvgs = getHVGs(sub)
+  pca = prcomp_irlba(t(logcounts(sub[hvgs,])), n = 50)
+  tsne = Rtsne(pca$x, pca = FALSE)
+  return(tsne$Y)
+})
+
+names(tsnes) = unique(meta$sample)
+
+colmax = max(log2(scores + 1))
+
+score_plots = lapply(unique(meta$sample), function(x){
+  
+  scr = log2(scores[meta$sample == x] + 1)
+  ord = order(scr)
+  p = ggplot(as.data.frame(tsnes[[as.character(x)]])[ord,],
+         aes(x = V1, y= V2, col = scr[ord])) +
+    geom_point(size = 0.6) +
+    scale_color_gradient2(name = "log2(score+1)", mid = "cornflowerblue", low = "gray75", high = "black", midpoint = max(colmax)/2) +
+    # scale_color_viridis() +
+    ggtitle(paste0("Sample ", x)) +
+    theme(legend.position = "none",
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          panel.background = element_rect(colour = "black", linetype = 1, size = 0.5))
+  
+  return(p)
+})
+
+plot_grid(plotlist = score_plots)
+
+
+```
+
+##Clustering doublets
+
+It is unlikely that per-cell doublet scoring is an effective strategy for identifying doublets along due to the stochastic nature of doublet simulation, and the noisy nature of single-cell data. Also, consider that doublets are likely to share similar transcriptional profiles that are distinct from single cells. We therefore use clustering to identify groups of cells in each sample, for more robust identification of doublets.
+
+To generate clusters, we build a shared nearest neighbour graph in each sample (based on distances in the first 50 PCs), from which clusters are identified using the louvain algorithm. We consider all genes when performing this clustering, as we have found that it more reliably segments doublet regions (perhaps due to technical effects e.g. increased library size). However, the clusters generated at by this procedure are frequently large, and regions of high doublet-scoring cells are frequently observed to be only part of a larger cluster that also contains many apparent singlets.
+
+To address this, we perform another round of clustering. Specifically, we take each cluster and perform the same clustering approach as described above to further subdivide it. We then continue with these sub-clusters for further analysis.
+
+An example of one such clustering is shown in Figure \@ref(fig:cluster).
+
+
+```{r cluster-top}
+
+clusters = lapply(unique(meta$sample), function(x){
+  sub_sce = scater::normalize(sce[,meta$sample == x])
+  sub_meta = meta[meta$sample == x,]
+
+  graph = buildSNNGraph(sub_sce, pc.approx = TRUE)
+  clusters = cluster_louvain(graph)
+
+  vec = as.numeric(membership(clusters))
+  names(vec) = sub_meta$cell
+  return(vec)
+})
+
+names(clusters) = unique(meta$sample)
+
+```
+
+```{r cluster-sub, warning = FALSE}
+
+clusters_sub = lapply(unique(meta$sample), function(x){
+  sub_sce = scater::normalize(sce[,meta$sample == x])
+  sub_meta = meta[meta$sample == x,]
+  clusts = clusters[[as.character(x)]]
+
+  sub_clusts = lapply(unique(clusts), function(y){
+    sub_sub_sce = scater::normalize(sub_sce[,clusts == y])
+    sub_sub_meta = sub_meta[clusts == y,]
+
+
+    graph = buildSNNGraph(sub_sub_sce, pc.approx = TRUE, d = min(c(ncol(sub_sub_sce)-1, 50)))
+    clusters = cluster_louvain(graph)
+
+    vec = as.numeric(membership(clusters))
+    vec = paste0(y, ".", vec)
+    names(vec) = sub_sub_meta$cell
+    return(vec)
+  })
+
+  clusts = do.call(c, sub_clusts)
+  clusts = clusts[match(meta$cell[meta$sample == x], names(clusts))]
+  return(clusts)
+})
+
+clusters = do.call(c, clusters)
+clusters_sub = do.call(c, clusters_sub)
+
+```
+
+
+```{r cluster, fig.wide = TRUE, fig.cap = "Sample 16, coloured by doublet score, top-level clusters, and sub-clusters"}
+
+
+clusters = clusters_sub
+meta$doub.density = scores
+
+
+sample = 16
+
+ord = order(scores[meta$sample == sample])
+p1 = ggplot(as.data.frame(tsnes[[as.character(sample)]])[ord,], aes(x = V1, y= V2, col = log2(scores[meta$sample == sample]+1)[ord])) +
+  geom_point(size = 0.7) +
+  ggtitle(paste0("Sample ", sample, " - doublet score")) +
+    theme(legend.position = "none",
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          panel.background = element_rect(colour = "black", linetype = 1, size = 0.5)) +
+  # scale_color_viridis() +
+  scale_color_gradient2(name = "log2(score+1)", mid = "cornflowerblue", low = "gray75", high = "black", midpoint = max(log2(scores[meta$sample == 23]+1))/2)
+
+col2 = regmatches(clusters[meta$sample == sample], regexpr("[0-9]+", clusters[meta$sample == sample]))
+
+p2 = ggplot(as.data.frame(tsnes[[as.character(sample)]])[ord,], aes(x = V1, y= V2, col = factor(col2)[ord])) +
+  geom_point(size = 0.7) +
+  ggtitle(paste0("Sample ", sample, " - clusters")) +
+    theme(legend.position = "none",
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          panel.background = element_rect(colour = "black", linetype = 1, size = 0.5)) +
+  scale_colour_Publication()
+
+p3 = ggplot(as.data.frame(tsnes[[as.character(sample)]])[ord,], aes(x = V1, y= V2, col = factor(clusters[meta$sample == sample])[ord])) +
+  geom_point(size = 0.7) +
+  ggtitle(paste0("Sample ", sample, " - sub-clusters")) +
+    theme(legend.position = "none",
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          panel.background = element_rect(colour = "black", linetype = 1, size = 0.5)) +
+  scale_colour_Publication()
+
+plot_grid(p1, p2, p3, nrow = 1)
+
+```
+
+The distribution of doublet scores for each cluster in each sample is shown in Figure \@ref(fig:sample-scores). Note the presence of clusters with very high doublet score distributions compared to most other cells in their samples.
+
+```{r sample-scores, fig.height = 20, fig.cap = "Doublet scores in each cluster of each sample. log2(score + 1) is shown on the y-axis; different clusters are shown on the x-axis."}
+maxscore = max(log2(scores+1))
+
+plots = lapply(unique(meta$sample), function(x){
+  
+  p = ggplot(data = data.frame(clusts = clusters[meta$sample == x],
+                           scores = log2(scores[meta$sample == x] + 1)),
+         mapping = aes(x = factor(clusts), y=scores, fill = factor(clusts))) +
+    geom_boxplot() +
+    theme(axis.text = element_blank(),
+          axis.title = element_blank(),
+          legend.position = "none") +
+    lims(y = c(0, maxscore)) +
+    scale_fill_Publication() +
+    ggtitle(paste0("Sample, ", x, "(n=", sampsize$value[match(x, sampsize$Var1)], ")"))
+  
+  return(p)
+})
+
+plot_grid(plotlist = plots, ncol = 3)
+
+```
+
+We can now test clusters for a higher than expected distribution of doublet scores. Such clusters are likely to be composed of doublets. Specifically, we consider the median doublet score of each cluster, analysing each sample separately. We label putative doublet clusters by considering a median-centred, MAD-estimated variance normal distribution of these medians: the cells in the clusters that sit outside of this distribution (FDR adjusted p<0.1, upper tail only) are labelled as doublets. These are shown in Figure \@ref(fig:scores-samples-clusters). The MAD-estimated variance was calculated using only the cluster medians above the across-sample median, to avoid the effects of zero-truncation of the distribution that would otherwise artificially shrink the MAD estimate.
+
+
+```{r scores-samples-clusters, fig.wide = TRUE, fig.cap = "Median doublet scores in each cluster in each sample. Points coloured grey correspond to singlet clusters, while coloured points are clusters considered to be doublets."}
+
+pdf = aggregate(meta$doub.density, list(meta$sample, clusters), median)
+
+names(pdf) = c("sample", "cluster", "median.score")
+
+mad_upper = function(x){
+  x = x-median(x)
+  return(mad(x[x>0], center = 0))
+}
+
+tests = lapply(unique(meta$sample), function(x){
+  sub = pdf[pdf$sample == x,]
+  scores_sample = meta$doub.density[meta$sample == x]
+  sub$p.value = pnorm(sub$median.score, mean = median(sub$median.score), sd = mad_upper(sub$median.score), lower.tail = FALSE)
+  return(sub)
+})
+pdf = do.call(rbind, tests)
+pdf$fdr = p.adjust(pdf$p.value, method = "fdr")
+pdf$n.cells = sapply(1:nrow(pdf), function(row){
+  sum(clusters == pdf$cluster[row] & meta$sample == pdf$sample[row])
+})
+
+pdf$frac.cells = sapply(1:nrow(pdf), function(row){
+  pdf$n.cells[row]/sum(pdf$n.cells[pdf$sample == pdf$sample[row]])
+})
+
+
+
+ggplot(pdf, aes(x = sample, y = log2(median.score + 1), col = factor(cluster))) +
+  geom_point(data = pdf[pdf$fdr < 0.1,], size = 2) +
+  geom_jitter(data = pdf[pdf$fdr >= 0.1,], col = "darkgrey", size = 0.4, width = 0.2, height = 0) +
+  scale_colour_Publication() +
+  theme(legend.position = "none") +
+  scale_x_continuous(breaks = 1:max(pdf$sample)) +
+  labs(x = "Sample", y = "log2(cluster median score + 1)")
+
+
+```
+
+## Testing doublet calls
+
+We consider three criteria for the success of our doublet-calling strategy.
+
+First, do the called doublets have larger library sizes than the singlets? Indeed they do, as shown in Figure \@ref(fig:libs).
+
+```{r libs, fig.cap = "Called doublets show larger library sizes than singlets."}
+
+doub.call = paste(meta$sample, clusters) %in% paste(pdf$sample, pdf$cluster)[pdf$fdr < 0.1]
+
+libs = Matrix::colSums(counts(sce))
+
+ggplot(mapping = aes(x = doub.call, y = libs)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("FALSE" = "Singlets", "TRUE" = "Doublets")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "#UMIs") +
+  scale_y_log10()
+```
+
+Second, are we calling a sensible number of doublets in each sample? This is shown in Figure \@ref(fig:frac-doubs). We note that, despite considerable sample-to-sample variation, there is a robust trend with more doublets detected in samples where more cells were identified.
+
+```{r frac-doubs, fig.cap = "Fraction of cells called as doublets in each sample"}
+
+fd = sapply(unique(meta$sample), function(x){
+  sum(doub.call[meta$sample == x])/sum(meta$sample == x)
+})
+
+nc = sapply(unique(meta$sample), function(x){
+  sum(meta$sample == x)
+})
+
+frac_doubs = ggplot(mapping = aes(x = nc, y = fd, fill = meta$stage[match(unique(meta$sample), meta$sample)])) + 
+  geom_point(shape = 21, size = 4, alpha = 1) +
+  scale_fill_manual(values = stage_colours, labels = stage_labels, name = "Stage") +
+  labs(x = "Number of cells", y = "Fraction of called doublets")
+
+frac_doubs
+
+```
+
+Finally, we can leverage the fact that our samples consist of pools of embryos of mixed sex. Individual cells should not express both *Xist*, which is a lncRNA with important functionality in X chromosome inactivation, and genes on the Y chromosome, which is present only in male cells. However, if a pool consists of a roughly equal number of embryos of each sex, half of any randomly formed doublets are likely to contain both Y chromosomal and *Xist* RNA. The fraction of cells with detectable coexpression will depend on the levels of expression of these genes, and the precise sexx blanace of the embryo pool, however. The fraction of libraries in each cluster that express both these genes is shown in Figure \@ref(fig:xist-score).
+
+```{r xist-score, fig.cap = "Coexpression of sex-linked genes in clusters labelled as singlet or doublet."}
+
+xist_on = counts(sce)[match("Xist", genes[,2]),]>0
+
+db = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+gene_map = getBM(attributes = c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = genes[,1], mart = db)
+sex_genes = c(gene_map[gene_map[,2] == "Y",1])
+sex_genes = sex_genes[sex_genes != "ENSMUSG00000096768"] #this gene has an X chromosome paralogue Erdr1 - exclude
+
+y_on = Matrix::colSums(counts(sce)[match(sex_genes, genes[,1]),] > 0 )>0
+
+sex = xist_on & y_on
+
+pdf$sex.frac = sapply(1:nrow(pdf), function(row){
+  select = clusters == pdf$cluster[row] & meta$sample == pdf$sample[row]
+  return(sum(sex[select])/sum(select))
+})
+
+pdf$stage = meta$stage[match(pdf$sample, meta$sample)]
+
+
+pdf$call = pdf$fdr < 0.1
+
+xist_plot = ggplot(pdf, aes(y = sex.frac, x = stage, fill = call)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Paired", labels = c("FALSE" = "Singlet", "TRUE" = "Doublet"), name = "") +
+  theme(axis.title.x = element_blank()) +
+  scale_x_discrete(labels = stage_labels) +
+  labs(y = "Fraction of cells coexpressing Xist + Y-CHR")
+
+xist_plot
+
+```
+
+## Refining doublet calls
+
+In some samples, it can be seen that not all cells in a region of high doublet density are actually called as doublets. This is likely due to the way that the clusters have formed - certain groups of cells may have been split between multiple clusters, or the doublets may have been too few to form their own cluster.
+
+To address this, we will consider all of the cells together, sharing information across samples. Clustering in this context should identify groups of cells containing many per-sample doublet calls. By focussing on these clusters, we can update our previous calls to identify doublets that may have escaped earlier calling. Here we do not subcluster, because there are sufficient numbers of doublets in this context to be properly grouped together. Moreover, we perform clustering on batch-corrected data, so that doublets in different samples are close to each other in the expression space. Specifically, we use the `fastMNN` function in *scran*, which applies the MNN algorithm in PC-space. We correct within each timepoint, moving from the largest samples to the smallest, before merging timepoints from oldest to youngest. The mixed gastrulation samples sit between timepoints E7.25 and E7.0.
+
+The fraction of called doublets in each all-data cluster is shown in Figure \@ref(fig:allcells). To identify clusters that contained more doublets than expected, we modelled the null distribution of doublet fraction as a median-centred, MAD-estimated variance normal distribution. MAD was estimated only from those fractions above the median, to avoid the effects of zero-truncation. We consider the clusters that sit outside of this distribution (FDR adjusted p<0.1, upper tail only) to contain doublets, and are coloured red in the plot. We update the calls of all cells in these subclusters to be labelled as doublets.
+
+
+```{r pca}
+
+hvgs = getHVGs(sce)
+
+pca = prcomp_irlba(t(logcounts(sce)[hvgs,]), n = 50)
+
+```
+
+
+```{r mnncorrect-all}
+
+hvgs = getHVGs(sce)
+
+#get order: oldest to youngest; most cells to least cells
+order_df = meta[!duplicated(meta$sample), c("stage", "sample")]
+order_df$ncells = sapply(order_df$sample, function(x) sum(meta$sample == x))
+order_df$stage = factor(order_df$stage, 
+                        levels = rev(c("E8.5", 
+                                   "E8.25", 
+                                   "E8.0", 
+                                   "E7.75", 
+                                   "E7.5", 
+                                   "E7.25", 
+                                   "mixed_gastrulation", 
+                                   "E7.0", 
+                                   "E6.75", 
+                                   "E6.5")))
+order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+order_df$stage = as.character(order_df$stage)
+
+all_correct = doBatchCorrect(counts = logcounts(sce)[rownames(sce) %in% hvgs,], 
+                             timepoints = meta$stage, 
+                             samples = meta$sample, 
+                             timepoint_order = order_df$stage, 
+                             sample_order = order_df$sample, 
+                             npc = 50)
+```
+
+```{r allcells, fig.wide = TRUE, fig.cap = "Fraction of called doublets in all-data subclusters. Subclusters coloured red were considered to be composed of doublets."}
+
+
+tsne = Rtsne(all_correct, pca = FALSE)$Y
+
+graph = buildSNNGraph(all_correct, d = NA, transposed = TRUE)
+set.seed(42)
+clusts = as.numeric(membership(cluster_louvain(graph)))
+names(clusts) = meta$cell
+
+tab = table(clusts, doub.call)
+tab = as.data.frame(sweep(tab, 1, rowSums(tab), "/"))
+tab = tab[as.logical(tab$doub.call),c(1,3)]
+tab$p = pnorm(tab$Freq, mean = median(tab$Freq), sd = mad_upper(tab$Freq), lower.tail = FALSE)
+tab$fdr = p.adjust(tab$p, method = "fdr")
+
+ggplot(mapping = aes(x = factor(rownames(tab), levels = rownames(tab)), y = tab[,2], fill = tab$fdr < 0.1)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "darkgrey")) +
+  theme(legend.position = "none", axis.text.x = element_blank(), axis.title.x = element_blank()) +
+  labs(y = "Fraction doublets in cluster")
+
+
+
+```
+
+These cluster-calls are shown in t-SNE in Figure \@ref(fig:big-tsne-doublets).
+
+```{r big-tsne-doublets, fig.wide = TRUE, fig.cap = "Doublet calls after across-sample calling. Cluster-doublets are called across samples, while Sample-doublets were called within samples."}
+
+
+
+cluster_calls = clusts %in% tab$clusts[tab$fdr < 0.1]
+
+cell_calls = doub.call
+state = rep("Singlet", nrow(meta))
+state[cluster_calls] = "Cluster-doublet"
+state[cell_calls] = "Sample-doublet"
+
+# ord = order(factor(state, levels = c("Singlet", "Cluster-doublet", "Sample-doublet")))
+ord = sample(length(state), length(state))
+
+ggplot(as.data.frame(tsne)[ord,], aes(x = V1, y= V2, col = state[ord])) +
+    geom_point(size = 0.7) +
+      theme(axis.line = element_blank(),
+            axis.ticks = element_blank(),
+            axis.text = element_blank(),
+            axis.title = element_blank(),
+            panel.background = element_rect(colour = "black", linetype = 1, size = 0.5)) +
+    scale_colour_manual(values = c("Singlet" = "darkgrey", "Cluster-doublet" = "coral", "Sample-doublet" = "cornflowerblue"),
+                        name = "") +
+    guides(colour = guide_legend(override.aes = list(size=6)))
+
+
+
+```
+
+Notably, this appears to improve the quality of doublet calls, identifying doublets in regions that had high doublet-scoring cells, but were not called as doublets in the per-sample analyses. This is shown in Figure \@ref(fig:call-plots), where cells called in samples are coloured in blue, and cells called using the all-data clustering approach are coloured in orange.
+
+```{r call-plots, warning = FALSE, fig.wide = FALSE, fig.height=80, fig.cap = "Doublet scores and calls are visualised. Left: doublet scores for each sample are shown on t-SNE; dark shading indicates higher doublet scores. Right: Doublet calls are shown; blue cells were called in each sample; orange cells were called across samples; grey cells are singlets."}
+
+
+
+plots_calls = lapply(unique(meta$sample), function(x){
+  keep = meta$sample == x
+  ord = order(factor(state, levels = c("Singlet", "Cluster-doublet", "Sample-doublet")[keep]))
+  state_sub = state[keep]
+  ggplot(as.data.frame(tsnes[[as.character(x)]])[ord,], aes(x = V1, y= V2,
+                                                                   col = state_sub[ord])) +
+    geom_point(size = 0.7) +
+    ggtitle(paste0("Sample ", x, " - calls")) +
+      theme(legend.position = "none",
+            axis.line = element_blank(),
+            axis.ticks = element_blank(),
+            axis.text = element_blank(),
+            axis.title = element_blank(),
+            panel.background = element_rect(colour = "black", linetype = 1, size = 0.5)) +
+    scale_colour_manual(values = c("Singlet" = "darkgrey", "Cluster-doublet" = "coral", "Sample-doublet" = "cornflowerblue"))
+})
+
+grids = lapply(1:length(plots_calls), function(x) plot_grid(score_plots[[x]], plots_calls[[x]]))
+grid = plot_grid(plotlist = grids, ncol =1)
+
+plot(grid)
+
+meta$doublet = state != "Singlet"
+
+```
+
+Finally, we note that these cluster-doublet calls resemble doublets by measure of library size and joint Xist/Y-chromosome gene expression, as do the cells called in each sample separately (Figure \@ref(fig:final-test)).
+
+```{r final-test, fig.wide = TRUE, fig.cap = "Doublets called either in samples, or when sharing data across samples, show both more UMI counts and increased coexpression of sex-linked genes compared with singlets.", warning = FALSE}
+
+
+p1 = ggplot(mapping = aes(x = state, y = libs)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("FALSE" = "Singlets", "TRUE" = "Doublets")) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "#UMIs") +
+  scale_y_log10() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+tab = table(sex, state, meta$stage)
+tab = as.data.frame(tab)
+tab$freq = sapply(1:nrow(tab), function(i){
+  if(i %% 2 == 1){
+    return(NA)
+  } else {
+    return(tab$Freq[i]/(tab$Freq[i] + tab$Freq[i-1]))
+  }
+})
+tab = tab[as.logical(tab$sex), c(2,3,5)]
+
+p2 = ggplot(tab, aes(x = state, y = freq, fill = Var3, group = Var3, col = Var3)) +
+  scale_fill_manual(values = stage_colours, labels = stage_labels) +
+  scale_colour_manual(values = stage_colours, labels = stage_labels) +
+  geom_line() +
+  geom_point(pch = 21, col = "black", size = 3) +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "Fraction Xist+YCHR cells") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+plot_grid(p1,p2)
+
+```
+
+#Stripped nuclei
+
+In some experiments, some clusters show particularly low mitochondrial read fractions alongside low library sizes. It has been suggested that these cells represent "stripped nuclei" - cells that have lost their cytoplasm before encapsulation in the droplets of the 10X Chromium machine. These cells cluster differently, likely because the nuclear and cytoplasmic RNA composition is different.
+
+In Figure \@ref(fig:lib-mt), the median mitochondrial gene expression fraction and the median library size for cells in each of the all-data clusters calculated in the previous section is shown. We label clusters with less than 0.5% mitochrondrial gene expression fraction as stripped nuclei, which will be excluded from further analysis.
+
+```{r lib-mt, fig.cap = "Stripped nucleus identification. Clusters with low mitochrondrial gene expression patterns also show small library sizes. Red coloured points are clusters that are excluded from downstream analyses."}
+
+mouse_ensembl = useMart("ensembl")
+mouse_ensembl = useDataset("mmusculus_gene_ensembl", mart = mouse_ensembl)
+
+gene_map = getBM(attributes=c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = genes[,1], mart = mouse_ensembl)
+
+mt.counts = counts(sce)[which(genes[,1] %in% gene_map$ensembl_gene_id[gene_map$chromosome_name=="MT"]), ]
+mt.fraction = Matrix::colSums(mt.counts)/Matrix::colSums(counts(sce))
+libsizes = Matrix::colSums(counts(sce))
+
+
+meds = data.frame(mt = sapply(unique(clusts), function(x) median(mt.fraction[clusts == x])),
+                  lib = sapply(unique(clusts), function(x) median(libsizes[clusts == x])),
+                  cluster = unique(clusts))
+
+meds$stripped = meds$mt < 0.005
+
+
+
+ggplot(meds, aes (x = mt, y = lib, col = stripped)) +
+  geom_point() +
+  labs(x = "Cluster median mitochondrial fraction",
+       y = "Cluster median library size") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black"))
+
+meta$stripped = clusts %in% meds$cluster[meds$stripped]
+
+```
+
+#Save the results
+
+We now save the metadata, updated with doublet and stripped nucleus calls. The total number of doublet calls is shown in Table \@ref(tab:doublets-tab), and the total number of stripped nucleus calls in \@ref(tab:stripped).
+
+```{r doublets-tab}
+
+kable(table(ifelse(meta$doublet, "Doublet", "Singlet"), meta$stage), caption = "Number of called doublets at each developmental timepoint.")
+
+
+```
+
+```{r stripped}
+
+kable(table(ifelse(meta$stripped, "Stripped", "Normal"), meta$stage), caption = "Number of called stripped nuclei at each developmental timepoint.")
+
+
+```
+
+```{r save}
+
+write.table(meta, file = "/nfs/research1/marioni/jonny/embryos/data/meta.tab", sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+save(list = ls(), file = "/nfs/research1/marioni/jonny/embryos/scripts/doublets/debug.RData")
+
+```
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```
+
+
+
