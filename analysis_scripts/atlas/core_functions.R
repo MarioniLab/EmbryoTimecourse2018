@@ -46,6 +46,41 @@ celltype_colours = c("Epiblast" = "#635547",
                      
 )
 
+haem_colours = c(
+  "Mes1"= "#c4a6b2",
+  "Mes2"= "#ca728c",
+  
+  "Cardiomyocytes" =  "#B51D8D",  
+  
+  "BP1" = "#6460c5",
+  "BP2" = "#96b8e4",
+  "Haem3"= "#02f9ff",
+  "BP3" = "#07499f",
+  "BP4" = "#036ef9",
+  
+  "Haem1"= "#bb22a7",
+  "Haem2" = "#f695e9",
+  "Haem4" = "#4c4a81",
+  
+  "EC1"= "#006737",
+  
+  "EC2" = "#5eba46",
+  "EC3" = "#818068",
+  "EC4"="#d6de22",
+  "EC5"="#5f7238",
+  "EC6"="#2ab572",
+  "EC7"="#000000",
+  "EC8"="#a0cb3b",
+  
+  "Ery1"="#f67a58",
+  "Ery2" ="#a26724",
+  "Ery3"="#cdaf7f",
+  "Ery4"= "#625218",
+  
+  "My" = "#c62127",
+  "Mk"= "#f6931d"
+)
+
 stage_colours = c("E6.5" = "#D53E4F",
                   "E6.75" = "#F46D43",
                   "E7.0" = "#FDAE61",
@@ -239,7 +274,6 @@ getHVGs = function(sce, min.mean = 1e-3, gene_df = genes){
   # mouse_ensembl = useDataset("mmusculus_gene_ensembl", mart = mouse_ensembl)
   # gene_map = getBM(attributes=c("ensembl_gene_id", "chromosome_name"), filters = "ensembl_gene_id", values = rownames(decomp), mart = mouse_ensembl)
   # ychr = gene_map[gene_map[,2] == "Y", 1]
-  #output was saved to file, for when biomaRt servers are down
   ychr = read.table("/nfs/research1/marioni/jonny/embryos/data/ygenes.tab", stringsAsFactors = FALSE)[,1]
   other = c("tomato-td") #for the chimera
   decomp = decomp[!rownames(decomp) %in% c(xist, ychr, other),]
@@ -249,6 +283,33 @@ getHVGs = function(sce, min.mean = 1e-3, gene_df = genes){
 }
 
 
+
+#use ensembl gene IDs
+enrich_genes_topGO = function(hits, universe, n.out = 100){
+  require(topGO)
+  require(org.Mm.eg.db)
+  
+  hits = as.character(hits)
+  universe = as.character(universe)
+  
+  input = as.numeric(universe %in% hits)
+  names(input) = universe
+  
+  topgo = new("topGOdata",
+              ontology = "BP",
+              geneSelectionFun = function(x){x==1},
+              allGenes = input,
+              # nodeSize = 10,
+              annot = annFUN.org,
+              mapping = "org.Mm.eg.db",
+              ID = "ensembl")
+  
+  ks.test = suppressMessages(
+    runTest(topgo, algorithm = "elim", statistic = "ks")
+    )
+  out = GenTable(topgo, ks.test, topNodes = n.out)
+  return(out)
+}
 
 #use ensembl gene IDs
 enrich_genes_goana = function(hits, universe, warn_missing = TRUE){
@@ -287,3 +348,104 @@ enrich_genes_goana = function(hits, universe, warn_missing = TRUE){
    
 }
 
+#MAPPING FUNCTIONS
+
+getmode <- function(v, dist) {
+  tab = table(v)
+  #if tie, break to shortest distance
+  if(sum(tab == max(tab)) > 1){
+    tied = names(tab)[tab == max(tab)]
+    sub = dist[v %in% tied]
+    names(sub) = v[v %in% tied]
+    return(names(sub)[which.min(sub)])
+  } else {
+    return(names(tab)[which.max(tab)])
+  }
+}
+
+mnnMap = function(atlas_pca, atlas_meta, map_pca, map_meta, k_map = 10){
+  require(kmknn)
+  require(scran)
+  
+  correct = fastMNN(atlas_pca, map_pca, pc.input = TRUE)$corrected
+  atlas = 1:nrow(atlas_pca)
+  correct_atlas = correct[atlas,]
+  correct_map = correct[-atlas,]
+  
+  knns = kmknn::queryKNN(correct_atlas, correct_map, k = k_map, get.index = TRUE, get.distance = FALSE)
+  
+  #get closest k matching cells
+  k.mapped = t(apply(knns$index, 1, function(x) atlas_meta$cell[x]))
+  celltypes = t(apply(k.mapped, 1, function(x) atlas_meta$celltype[match(x, atlas_meta$cell)]))
+  stages = t(apply(k.mapped, 1, function(x) atlas_meta$stage[match(x, atlas_meta$cell)]))
+  celltype.mapped = apply(celltypes, 1, function(x) getmode(x, 1:length(x)))
+  stage.mapped = apply(stages, 1, function(x) getmode(x, 1:length(x)))
+  
+  out = lapply(1:length(celltype.mapped), function(x){
+    list(cells.mapped = k.mapped[x,],
+         celltype.mapped = celltype.mapped[x],
+         stage.mapped = stage.mapped[x])
+  })
+  
+  names(out) = map_meta$cell
+  
+  return(out)
+  
+}
+
+#meta MUST have a cell column, celltype column and a stage column, spelled exactly like that
+mapWrap = function(atlas_sce, atlas_meta, map_sce, map_meta, k = 10, return.list = FALSE){
+  require(scran)
+  #prevent duplicate rownames
+  colnames(map_sce) = paste0("map_", colnames(map_sce))
+  map_meta$cell = paste0("map_", map_meta$cell)
+  
+  big_sce = scater::normalize(cbind(atlas_sce, map_sce))
+  hvgs = getHVGs(big_sce)
+  big_pca = prcomp_irlba(t(logcounts(big_sce[hvgs,])), n = 50)$x
+  rownames(big_pca) = colnames(big_sce) 
+  atlas_pca = big_pca[1:ncol(atlas_sce),]
+  map_pca = big_pca[-(1:ncol(atlas_sce)),]
+  
+  #correct the atlas first
+  order_df = atlas_meta[!duplicated(atlas_meta$sample), c("stage", "sample")]
+  order_df$ncells = sapply(order_df$sample, function(x) sum(atlas_meta$sample == x))
+  order_df$stage = factor(order_df$stage, 
+                          levels = rev(c("E8.5", 
+                                         "E8.25", 
+                                         "E8.0", 
+                                         "E7.75", 
+                                         "E7.5", 
+                                         "E7.25", 
+                                         "mixed_gastrulation", 
+                                         "E7.0", 
+                                         "E6.75", 
+                                         "E6.5")))
+  order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+  order_df$stage = as.character(order_df$stage)
+  
+  set.seed(42)
+  atlas_corrected = doBatchCorrect(counts = logcounts(atlas_sce[hvgs,]), 
+                                   timepoints = atlas_meta$stage, 
+                                   samples = atlas_meta$sample, 
+                                   timepoint_order = order_df$stage, 
+                                   sample_order = order_df$sample, 
+                                   pc_override = atlas_pca)
+  
+  mapping = mnnMap(atlas_pca = atlas_corrected,
+                   atlas_meta = atlas_meta,
+                   map_pca = map_pca,
+                   map_meta = map_meta)
+  if(return.list){
+    return(mapping)
+  }
+  
+  cn = substr(names(mapping), 5, nchar(names(mapping))) # remove 
+  ct = sapply(mapping, function(x) x$celltype.mapped)
+  st = sapply(mapping, function(x) x$stage.mapped)
+  closest = sapply(mapping, function(x) x$cells.mapped[1])
+  
+  out = data.frame(cell = cn, celltype.mapped = ct, stage.mapped = st, closest.cell = closest)
+  return(out)
+  
+}
