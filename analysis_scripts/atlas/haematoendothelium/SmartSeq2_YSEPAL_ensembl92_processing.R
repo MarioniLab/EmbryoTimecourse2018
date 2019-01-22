@@ -30,7 +30,7 @@ load(paste0(wd,"DATA/Smartseq2_YSEPAL/PhD_BPS13_run2_metadata.rda"))
 colnames(metadata)<-gsub('\\.','',colnames(metadata))
 
 rownames(metadata) <- as.character(paste0(metadata$CRIidentifier,".",metadata$CIannotationofindex))
-rownames(metadata)<-sub("-",".",colnames(counts))
+rownames(metadata)<-sub("-",".",rownames(metadata))
 rownames(metadata)<-sub(".i5","_i5",rownames(metadata))
 
 
