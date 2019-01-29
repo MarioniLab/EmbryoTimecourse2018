@@ -1,0 +1,210 @@
+---
+title: "Tal1 chimera: Mapping blood cells to the atlas"
+author: "Pijuan-Sala, Griffiths, Guibentif et al.: A single-cell resolution molecular roadmap from mouse gastrulation to early organogenesis."
+output:
+  BiocStyle::html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes  
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: true
+    theme: united
+---
+#Introduction
+
+In this script we map cells from the wild-type chimera onto our atlas dataset. We use the same approach as described for the wild-type chimera.
+
+```{r load, message = FALSE}
+library(Matrix)
+library(scran)
+library(scater)
+library(knitr)
+library(pheatmap)
+library(edgeR)
+
+source("/nfs/research1/marioni/jonny/embryos/scripts/core_functions.R")
+load_data(remove_doublets = TRUE, remove_stripped = TRUE)
+
+keep = meta$celltype %in% c("Mixed mesoderm",
+                                   "Endothelium",
+                                   "Haematoendothelial progenitors")
+
+keep[grepl("Erythroid", meta$celltype)] = TRUE
+keep[grepl("Blood", meta$celltype)] = TRUE
+
+atlas_sce = scater::normalize(sce[, keep])
+atlas_meta = meta[keep,]
+
+source("/nfs/research1/marioni/jonny/chimera-tal1/scripts/core_functions.R")
+load_data()
+
+keep = meta$celltype.mapped %in% c("Mixed mesoderm",
+                                   "Endothelium",
+                                   "Haematoendothelial progenitors")
+
+keep[grepl("Erythroid", meta$celltype.mapped)] = TRUE
+keep[grepl("Blood", meta$celltype.mapped)] = TRUE
+
+sce = scater::normalize(sce[, keep])
+meta = meta[keep,]
+
+```
+
+
+```{r functions}
+getmode <- function(v, dist) {
+  tab = table(v)
+  #if tie, break to shortest distance
+  if(sum(tab == max(tab)) > 1){
+    tied = names(tab)[tab == max(tab)]
+    sub = dist[v %in% tied]
+    names(sub) = v[v %in% tied]
+    return(names(sub)[which.min(sub)])
+  } else {
+    return(names(tab)[which.max(tab)])
+  }
+}
+
+mnnMap = function(atlas_pca, atlas_meta, map_pca, map_meta, k_map = 10){
+  require(kmknn)
+  require(scran)
+  
+  correct = fastMNN(atlas_pca, map_pca, pc.input = TRUE)$corrected
+  atlas = 1:nrow(atlas_pca)
+  correct_atlas = correct[atlas,]
+  correct_map = correct[-atlas,]
+  
+  knns = kmknn::queryKNN(correct_atlas, correct_map, k = k_map, get.index = TRUE, get.distance = FALSE)
+  
+  #get closest k matching cells
+  k.mapped = t(apply(knns$index, 1, function(x) atlas_meta$cell[x]))
+  celltypes = t(apply(k.mapped, 1, function(x) atlas_meta$celltype[match(x, atlas_meta$cell)]))
+  stages = t(apply(k.mapped, 1, function(x) atlas_meta$stage[match(x, atlas_meta$cell)]))
+  celltype.mapped = apply(celltypes, 1, function(x) getmode(x, 1:length(x)))
+  stage.mapped = apply(stages, 1, function(x) getmode(x, 1:length(x)))
+  
+  out = lapply(1:length(celltype.mapped), function(x){
+    list(cells.mapped = k.mapped[x,],
+         celltype.mapped = celltype.mapped[x],
+         stage.mapped = stage.mapped[x])
+  })
+  
+  names(out) = map_meta$cell
+  
+  return(out)
+  
+}
+
+#meta MUST have a cell column, celltype column and a stage column, spelled exactly like that
+mapWrap = function(atlas_sce, atlas_meta, map_sce, map_meta, k = 10, return.list = FALSE){
+  require(scran)
+  #prevent duplicate rownames
+  colnames(map_sce) = paste0("map_", colnames(map_sce))
+  map_meta$cell = paste0("map_", map_meta$cell)
+  
+  big_sce = scater::normalize(cbind(atlas_sce, map_sce))
+  hvgs = getHVGs(big_sce)
+  big_pca = prcomp_irlba(t(logcounts(big_sce[hvgs,])), n = 50)$x
+  rownames(big_pca) = colnames(big_sce) 
+  atlas_pca = big_pca[1:ncol(atlas_sce),]
+  map_pca = big_pca[-(1:ncol(atlas_sce)),]
+  
+  #correct the atlas first
+  order_df = atlas_meta[!duplicated(atlas_meta$sample), c("stage", "sample")]
+  order_df$ncells = sapply(order_df$sample, function(x) sum(atlas_meta$sample == x))
+  order_df$stage = factor(order_df$stage, 
+                          levels = rev(c("E8.5", 
+                                         "E8.25", 
+                                         "E8.0", 
+                                         "E7.75", 
+                                         "E7.5", 
+                                         "E7.25", 
+                                         "mixed_gastrulation", 
+                                         "E7.0", 
+                                         "E6.75", 
+                                         "E6.5")))
+  order_df = order_df[order(order_df$stage, order_df$ncells, decreasing = TRUE),]
+  order_df$stage = as.character(order_df$stage)
+  
+  set.seed(42)
+  atlas_corrected = doBatchCorrect(counts = logcounts(atlas_sce[hvgs,]), 
+                                   timepoints = atlas_meta$stage, 
+                                   samples = atlas_meta$sample, 
+                                   timepoint_order = order_df$stage, 
+                                   sample_order = order_df$sample, 
+                                   pc_override = atlas_pca)
+  
+  mapping = mnnMap(atlas_pca = atlas_corrected,
+                   atlas_meta = atlas_meta,
+                   map_pca = map_pca,
+                   map_meta = map_meta)
+  if(return.list){
+    return(mapping)
+  }
+  
+  cn = substr(names(mapping), 5, nchar(names(mapping))) # remove 
+  ct = sapply(mapping, function(x) x$celltype.mapped)
+  st = sapply(mapping, function(x) x$stage.mapped)
+  closest = sapply(mapping, function(x) x$cells.mapped[1])
+  
+  out = data.frame(cell = cn, celltype.mapped = ct, stage.mapped = st, closest.cell = closest)
+  return(out)
+  
+}
+
+
+# mapcell = function(cell, atlas = ref, metadata = atlas_meta, k = 10){
+#   dists = as.numeric(-cor(cell, atlas))
+#   #find closest matching cell
+#   cell.mapped = colnames(atlas)[which.min(dists)]
+# 
+#   clusterid = metadata$celltype
+#   clusterid[metadata$doublet] = "Doublet"
+#   clusterid[metadata$stripped] = "Stripped"
+# 
+#   #get closest k matching cells
+#   k.mapped = colnames(atlas)[order(dists)[1:k]]
+#   k.dists = dists[order(dists)[1:k]]
+#   cluster.mapped = getmode(clusterid[match(k.mapped, metadata$cell)], k.dists)
+#   stage.mapped = getmode(metadata$stage[match(k.mapped, metadata$cell)], k.dists)
+# 
+#   return(list(cell.mapped = cell.mapped,
+#               k.mapped = k.mapped,
+#               cluster.mapped = cluster.mapped,
+#               stage.mapped = stage.mapped))
+# 
+# }
+
+```
+
+
+#Chimera mapping
+
+```{r map}
+set.seed(42)
+mappings = lapply(unique(meta$sample), function(x){
+  mapWrap(atlas_sce, atlas_meta, sce[-nrow(sce), meta$sample == x], meta[meta$sample == x,], return.list = TRUE)
+})
+
+# mappings = do.call(rbind, mappings)
+# mappings_list = do.call(rbind, mappings_list)
+
+saveRDS(mappings, file = "/nfs/research1/marioni/jonny/chimera-tal1/scripts/map_blood/mapping_chimera.rds")
+
+# mappings = readRDS("/nfs/research1/marioni/jonny/chimera-tal1/scripts/map_blood/mapping_chimera.rds")
+
+# meta$stage.mapped = mappings$stage.mapped[match(meta$cell, mappings$cell)]
+# meta$celltype.mapped = mappings$celltype.mapped[match(meta$cell, mappings$cell)]
+# meta$closest.cell = mappings$closest.cell[match(meta$cell, mappings$cell)]
+
+```
+
+
+#Session Info
+```{r sessinf}
+sessionInfo()
+```
